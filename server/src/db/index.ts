@@ -223,9 +223,12 @@ export function initDb(
 }
 
 export function getUnifiedApiKey(): string {
+  if (process.env.UNIFIED_API_KEY) {
+    return process.env.UNIFIED_API_KEY;
+  }
   const db = getDb();
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string };
-  return row.value;
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
+  return row?.value ?? '';
 }
 
 export function regenerateUnifiedKey(): string {

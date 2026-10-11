@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: freellmapi
+    env: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /api/ping
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FREELLMAPI_INSTALL_METHOD
+        value: render

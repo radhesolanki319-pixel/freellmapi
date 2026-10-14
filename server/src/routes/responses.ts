@@ -166,16 +166,7 @@ const otherKnownItemSchema = z.object({
   id: z.string().optional(),
 }).passthrough();
 
-const inputItemSchema = z.union([
-  functionCallItemSchema,
-  functionCallOutputItemSchema,
-  computerCallItemSchema,
-  computerCallOutputItemSchema,
-  reasoningItemSchema,
-  localShellCallItemSchema,
-  otherKnownItemSchema,
-  messageItemSchema,
-]);
+const inputItemSchema = z.record(z.string(), z.unknown()).passthrough();
 
 // Accept ANY tool type, not just 'function'. Codex (Responses API) sends
 // built-in tools like `web_search` / `local_shell` alongside function tools;
@@ -377,10 +368,10 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
     }
 
     // message item
-    const m = item as z.infer<typeof messageItemSchema>;
+    const m = item as any;
     // 'developer' is the Responses-era system role.
-    const role = m.role === 'developer' ? 'system' : m.role;
-    const content = partsToChatContent(m.content);
+    const role = m.role === 'developer' ? 'system' : (m.role || 'user');
+    const content = m.content ? partsToChatContent(m.content) : '';
 
     if (role === 'system') {
       // Hoist system/developer messages to the start of the conversation:

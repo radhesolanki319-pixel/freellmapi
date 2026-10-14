@@ -1,4 +1,8 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { spawn } from 'child_process';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
@@ -46,7 +50,15 @@ const AUTO_MODEL_ID = 'auto';
 function isAutoModel(modelId: string | undefined): boolean {
   if (!modelId) return true;
   const lower = modelId.toLowerCase();
-  return lower === AUTO_MODEL_ID || lower.startsWith(`${AUTO_MODEL_ID}:`);
+  return (
+    lower === AUTO_MODEL_ID ||
+    lower.startsWith(`${AUTO_MODEL_ID}:`) ||
+    lower === 'gpt-6-astra' ||
+    lower === 'openai/gpt-6-astra' ||
+    lower.includes('6-astra') ||
+    lower.includes('6astar') ||
+    lower.startsWith('gpt-6')
+  );
 }
 
 // timingSafeStringEqual moved to lib/system-prompt.ts (resolveAuth needs it
@@ -824,6 +836,121 @@ proxyRouter.post('/audio/speech', async (req: Request, res: Response) => {
     const httpStatus = status >= 400 && status < 600 ? status : 502;
     res.status(httpStatus).json({ error: { message: `speech error: ${err?.message ?? 'unknown'}`, type: mediaErrorType(status) } });
   }
+});
+
+// J.A.R.V.I.S. Ultra-Natural Voice Engine (Gemini DeepMind Live + Copilot Multilingual)
+proxyRouter.get('/audio/jarvis', async (req: Request, res: Response) => {
+  const text = String(req.query.text || '').trim();
+  if (!text) {
+    res.status(400).send('Text parameter required');
+    return;
+  }
+  const clean = text.replace(/<[^>]*>/g, '').replace(/[*#_~`>]/g, '').slice(0, 600);
+  const voice = String(req.query.voice || 'gemini-charon').trim();
+
+  const isGemini = voice.startsWith('gemini') || voice === 'natural' || voice === 'human';
+  const ext = isGemini ? 'wav' : 'mp3';
+  const hash = crypto.createHash('md5').update('jarvis_v4_' + voice + '_' + clean).digest('hex');
+  const cacheDir = path.join(os.homedir(), '.cache', 'jarvis_tts');
+  if (!fs.existsSync(cacheDir)) {
+    try { fs.mkdirSync(cacheDir, { recursive: true }); } catch {}
+  }
+  const cachePath = path.join(cacheDir, `${hash}.${ext}`);
+
+  if (fs.existsSync(cachePath)) {
+    res.setHeader('Content-Type', ext === 'wav' ? 'audio/wav' : 'audio/mpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    fs.createReadStream(cachePath).pipe(res);
+    return;
+  }
+
+  // 1. If Gemini Voice requested (or default/edith/karen), synthesize via Google DeepMind multimodal audio
+  if (isGemini || voice.includes('edith') || voice.includes('karen')) {
+    try {
+      let gVoice = 'Charon';
+      if (voice === 'gemini-fenrir') gVoice = 'Fenrir';
+      else if (voice.includes('edith')) gVoice = 'Kore';
+      else if (voice.includes('karen')) gVoice = 'Achernar';
+
+      const result = await runSpeech('gemini-2.5-flash-preview-tts', {
+        input: clean,
+        voice: gVoice,
+      });
+      if (result && result.audio && result.audio.length > 0) {
+        fs.writeFileSync(cachePath, result.audio);
+        res.setHeader('Content-Type', result.contentType || 'audio/wav');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.send(result.audio);
+        return;
+      }
+    } catch (err: any) {
+      // If Gemini speech fails or is unavailable, smoothly fallback
+      console.warn('[JarvisAudio] Gemini audio fallback triggered:', err?.message || err);
+    }
+  }
+
+  // 2. Microsoft Copilot Multilingual & Neural Edge-TTS fallback
+  let edgeVoice = 'en-US-BrianMultilingualNeural';
+  let pitch = '-2Hz';
+  let rate = '-1%';
+
+   if (voice === 'edith-hindi' || voice === 'karen-hindi') {
+     edgeVoice = 'hi-IN-SwaraNeural';
+     pitch = '-1Hz';
+     rate = '-1%';
+   } else
+  if (voice.includes('edith')) {
+    edgeVoice = 'en-US-JennyNeural';
+    pitch = '+1Hz';
+    rate = '-1%';
+  } else if (voice.includes('karen')) {
+    edgeVoice = 'en-US-AvaMultilingualNeural';
+    pitch = '+0Hz';
+    rate = '-1%';
+  } else if (voice === 'jenna') {
+    edgeVoice = 'en-US-JennyNeural';
+    pitch = '+0Hz';
+    rate = '+0%';
+  } else if (voice === 'ryan' || voice === 'british' || voice === 'jarvis-ryan') {
+    edgeVoice = 'en-GB-RyanNeural';
+    pitch = '-3Hz';
+    rate = '-2%';
+  } else if (voice === 'salman' || voice === 'salman-hindustani') {
+    edgeVoice = 'ur-IN-SalmanNeural';
+    pitch = '-2Hz';
+    rate = '-1%';
+  } else if (voice === 'madhur' || voice === 'madhur-hindi') {
+    edgeVoice = 'hi-IN-MadhurNeural';
+    pitch = '-2Hz';
+    rate = '-1%';
+  } else if (voice === 'andrew') {
+    edgeVoice = 'en-US-AndrewMultilingualNeural';
+  } else if (voice === 'william') {
+    edgeVoice = 'en-AU-WilliamMultilingualNeural';
+  }
+
+  const mp3Path = path.join(cacheDir, `${hash}.mp3`);
+  const proc = spawn('edge-tts', [
+    '--voice', edgeVoice,
+    `--pitch=${pitch}`,
+    `--rate=${rate}`,
+    '--text', clean,
+    '--write-media', mp3Path
+  ]);
+
+  proc.on('close', (code) => {
+    if (code === 0 && fs.existsSync(mp3Path)) {
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      fs.createReadStream(mp3Path).pipe(res);
+    } else {
+      res.status(500).send('Synthesis failed');
+    }
+  });
+
+  proc.on('error', (err) => {
+    res.status(500).send('Spawn error: ' + err.message);
+  });
 });
 
 // OpenAI-compatible speech-to-text (/v1/audio/transcriptions). Multipart form

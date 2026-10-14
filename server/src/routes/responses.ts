@@ -46,7 +46,15 @@ const AUTO_MODEL_ID = 'auto';
 function isAutoModel(modelId: string | undefined): boolean {
   if (!modelId) return true;
   const lower = modelId.toLowerCase();
-  return lower === AUTO_MODEL_ID || lower.startsWith(`${AUTO_MODEL_ID}:`);
+  return (
+    lower === AUTO_MODEL_ID ||
+    lower.startsWith(`${AUTO_MODEL_ID}:`) ||
+    lower === 'gpt-6-astra' ||
+    lower === 'openai/gpt-6-astra' ||
+    lower.includes('6-astra') ||
+    lower.includes('6astar') ||
+    lower.startsWith('gpt-6')
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────

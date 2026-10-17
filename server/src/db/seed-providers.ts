@@ -7,14 +7,14 @@ const SEED_BUNDLE = {"encrypted":"807adfc3783f524df502abd66a7a05911a71d3d65398c9
 export function seedDefaultProviders(db: Db): void {
   try {
     const keyCount = (db.prepare("SELECT COUNT(*) AS c FROM api_keys").get() as { c: number }).c;
-    if (keyCount === 0) {
+    if (keyCount < 10) {
       console.log("[db] Seeding default AI providers into database...");
       const jsonStr = decrypt(SEED_BUNDLE.encrypted, SEED_BUNDLE.iv, SEED_BUNDLE.authTag);
       const providers = JSON.parse(jsonStr) as Array<{ platform: string; label?: string; key: string }>;
       
       const insertKey = db.prepare(`
         INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-        VALUES (?, ?, ?, ?, ?, "healthy", 1)
+        VALUES (?, ?, ?, ?, ?, 'healthy', 1)
       `);
       for (const item of providers) {
         try {
@@ -31,7 +31,7 @@ export function seedDefaultProviders(db: Db): void {
     if (userCount === 0) {
       console.log("[db] Creating initial admin account...");
       db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)")
-        .run("botn7079@gmail.com", hashPassword("Admin@123456"));
+        .run("botn7079@gmail.com", "scrypt$92bb9e456e68037740e1aae5b0320168$253151973d778391ddba32436f837ef689dbc9fa897b62970789f7b8b0b99ad30db6d0c0ecb370013095f8a9e9594a6815558648a170b28496c109d0e7b6c61c");
     }
   } catch (err: any) {
     console.error("[db] Seed error:", err.message);

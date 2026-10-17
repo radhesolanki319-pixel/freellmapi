@@ -166,7 +166,7 @@ const otherKnownItemSchema = z.object({
   id: z.string().optional(),
 }).passthrough();
 
-const inputItemSchema = z.record(z.string(), z.unknown()).passthrough();
+const inputItemSchema = z.record(z.string(), z.unknown());
 
 // Accept ANY tool type, not just 'function'. Codex (Responses API) sends
 // built-in tools like `web_search` / `local_shell` alongside function tools;
@@ -351,12 +351,13 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
     }
 
     if ('type' in item && item.type === 'function_call_output') {
-      const output = typeof item.output === 'string'
-        ? item.output
-        : Array.isArray(item.output)
-          ? partsToString(item.output as any)
-          : JSON.stringify(item.output);
-      messages.push({ role: 'tool', tool_call_id: item.call_id, content: output });
+      const fc = item as z.infer<typeof functionCallOutputItemSchema>;
+      const output = typeof fc.output === 'string'
+        ? fc.output
+        : Array.isArray(fc.output)
+          ? partsToString(fc.output as any)
+          : JSON.stringify(fc.output);
+      messages.push({ role: 'tool', tool_call_id: fc.call_id, content: output });
       continue;
     }
 

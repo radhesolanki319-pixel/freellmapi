@@ -28,10 +28,14 @@ export function seedDefaultProviders(db: Db): void {
     }
 
     const userCount = (db.prepare("SELECT COUNT(*) AS c FROM users").get() as { c: number }).c;
+    const adminHash = "scrypt$a2b3a1d03dea73c0b7a9131ed86bcd7a$03791a89051cf40c4347038538c8e4cb8359b773ccbbae8b8525870a8a9bd7eaa9c7771d2a267fcb89dadd47646d470db14d77fb6eb4c7e34aabb3cd7e06c347";
     if (userCount === 0) {
       console.log("[db] Creating initial admin account...");
       db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)")
-        .run("botn7079@gmail.com", "scrypt$92bb9e456e68037740e1aae5b0320168$253151973d778391ddba32436f837ef689dbc9fa897b62970789f7b8b0b99ad30db6d0c0ecb370013095f8a9e9594a6815558648a170b28496c109d0e7b6c61c");
+        .run("botn7079@gmail.com", adminHash);
+    } else {
+      db.prepare("UPDATE users SET password_hash = ? WHERE email = ?")
+        .run(adminHash, "botn7079@gmail.com");
     }
   } catch (err: any) {
     console.error("[db] Seed error:", err.message);

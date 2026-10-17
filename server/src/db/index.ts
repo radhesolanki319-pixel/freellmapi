@@ -4,6 +4,7 @@ import path from 'path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'url';
 import { runMigrationsSync } from './migrate/runner.js';
+import { seedDefaultProviders } from './seed-providers.js';
 import { initEncryptionKey, isEncryptionKeyInitialized } from '../lib/crypto.js';
 import { restrictAllToOwner, restrictDirToOwner } from '../lib/file-permissions.js';
 import { nodeSqliteFactory } from './node-sqlite.js';
@@ -218,6 +219,7 @@ export function initDb(
   }
 
   if (!isEncryptionKeyInitialized()) initEncryptionKey(db);
+  seedDefaultProviders(db);
 
   return db;
 }

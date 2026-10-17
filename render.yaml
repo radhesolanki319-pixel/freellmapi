@@ -12,6 +12,8 @@ services:
         value: render
       - key: UNIFIED_API_KEY
         value: freellmapi-c7bf396fcf0351dbba9546933a8881054c627e6f78875206
+      - key: ENCRYPTION_KEY
+        value: b1f2877d335e749c7f5efdbeb00016ba001dca5e8a7c8fe8d327aa08c1cc066e
       - key: PORT
         value: 3001
       - key: HOST

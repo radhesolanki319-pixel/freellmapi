@@ -18,6 +18,7 @@ import {
   type GeminiInboundRequest,
 } from '../lib/gemini-wire.js';
 import { resolveGeminiModel } from '../services/gemini-map.js';
+import { RADHE_FLAGSHIP_ROSTER, resolveFlagshipModel } from '../services/anthropic-map.js';
 
 export const geminiRouter = Router();
 
@@ -79,33 +80,36 @@ function modelShape(model: NormalizedModel | null, autoContextWindow: number | n
 
 geminiRouter.get('/models', (req, res) => {
   if (!authenticate(req, res)) return;
-  const { models, autoContextWindow } = buildModelListing();
-  const availableOnly = String(req.query.available ?? '').toLowerCase();
-  const listed = ['1', 'true', 'yes'].includes(availableOnly)
-    ? models.filter(model => model.available === 1)
-    : models;
   res.json({
-    models: [
-      modelShape(null, autoContextWindow),
-      ...listed.map(model => modelShape(model, autoContextWindow)),
-    ],
+    models: RADHE_FLAGSHIP_ROSTER.map(m => ({
+      name: `models/${m.id}`,
+      displayName: m.name,
+      description: `Radhe's Flagship SOTA Engine served by ${m.ownedBy}`,
+      inputTokenLimit: m.contextWindow,
+      outputTokenLimit: 8192,
+      supportedGenerationMethods: ['generateContent', 'streamGenerateContent', 'countTokens'],
+      version: m.id,
+    })),
   });
 });
 
 geminiRouter.get(/^\/models\/(.+)$/, (req, res) => {
   if (!authenticate(req, res)) return;
   const requested = decodeURIComponent(req.params[0]).replace(/^models\//, '');
-  const { models, autoContextWindow } = buildModelListing();
-  if (requested === 'auto') {
-    res.json(modelShape(null, autoContextWindow));
-    return;
-  }
-  const model = models.find(entry => entry.id === requested);
-  if (!model) {
+  const m = resolveFlagshipModel(requested);
+  if (!m) {
     sendError(res, 404, `Model '${requested}' was not found`, 'NOT_FOUND');
     return;
   }
-  res.json(modelShape(model, autoContextWindow));
+  res.json({
+    name: `models/${m.id}`,
+    displayName: m.name,
+    description: `Radhe's Flagship SOTA Engine served by ${m.ownedBy}`,
+    inputTokenLimit: m.contextWindow,
+    outputTokenLimit: 8192,
+    supportedGenerationMethods: ['generateContent', 'streamGenerateContent', 'countTokens'],
+    version: m.id,
+  });
 });
 
 function parseGenerateBody(req: Request, res: Response): GeminiInboundRequest | null {

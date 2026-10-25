@@ -10,7 +10,7 @@ import type {
   ChatContentBlock,
 } from '@freellmapi/shared/types.js';
 import { routeRequest, resolveModelGroupCandidates, resolveStickyPreference, routingReserveTokens, type RouteResult, type ChainRow } from '../services/router.js';
-import { getSetting, getUnifiedApiKey } from '../db/index.js';
+import { getDb, getSetting, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { resolveTaskType } from '../lib/task-type.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -24,7 +24,7 @@ import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel 
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
 import { routedViaValue } from '../lib/header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
-import { resolveAnthropicModel, claudeFamilyDiscoveryEntries } from '../services/anthropic-map.js';
+import { resolveAnthropicModel, claudeFamilyDiscoveryEntries, RADHE_FLAGSHIP_ROSTER, resolveFlagshipModel } from '../services/anthropic-map.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import type { ReasoningEffort } from '../lib/sampling-params.js';
 import { buildModelListing } from '../services/model-listing.js';
@@ -452,9 +452,20 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
 
   const body = parsed.data;
   const requestedModel = body.model ?? 'auto';
-  const routedModel = body.model?.startsWith('claude/')
+  let routedModel = body.model?.startsWith('claude/')
     ? body.model.slice('claude/'.length)
     : body.model;
+
+  const flagship = resolveFlagshipModel(routedModel);
+  if (flagship && !flagship.isClaudeFamily) {
+    if (flagship.target === 'auto') {
+      routedModel = 'auto';
+    } else {
+      const db = getDb();
+      const hasTarget = db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(flagship.target);
+      routedModel = hasTarget ? flagship.target : 'auto';
+    }
+  }
   // The Anthropic wire format requires max_tokens, but OUR default injection
   // must not change the budget gate's verdict: gating AFTER defaulting made a
   // no-max_tokens request 413 here (input + 1024 over budget) where the chat
@@ -1078,36 +1089,16 @@ anthropicRouter.post('/messages/count_tokens', (req: Request, res: Response) => 
 // CLAUDE_FAMILY_ALIASES for why, and note /messages already routed those ids
 // long before they were listed here.
 //
-// Optional `claude/<real-id>` aliases let Claude Code's gateway picker discover
-// the full catalog; /messages strips the synthetic prefix before routing.
+// Anthropic-compatible GET /v1/models - strictly exposes ONLY the 28 Radhe Flagship Models
 anthropicRouter.get('/models', (req: Request, res: Response, next: NextFunction) => {
   if (!req.headers['anthropic-version']) return next(); // OpenAI client → proxyRouter
   if (!authenticate(req, res)) return;
 
-  const { models } = buildModelListing();
-  const available = models.filter(m => m.available === 1);
-  const aliasesEnabled = getSetting('expose_cc_discovery_aliases') === '1';
-  const data = [
-    { type: 'model' as const, id: 'auto', display_name: 'Auto (router picks the best available model)', created_at: MODEL_CREATED_AT },
-    // Only when something can actually serve them: advertising a Sonnet slot
-    // backed by an empty pool would trade "0 models" for a model that 503s.
-    ...(available.length > 0
-      ? claudeFamilyDiscoveryEntries().map(a => ({
-        type: 'model' as const,
-        id: a.id,
-        display_name: a.displayName,
-        created_at: MODEL_CREATED_AT,
-      }))
-      : []),
-    ...available.map(m => ({ type: 'model' as const, id: m.id, display_name: m.name, created_at: MODEL_CREATED_AT })),
-    ...(aliasesEnabled
-      ? available.map(m => ({
-        type: 'model' as const,
-        id: `claude/${m.id}`,
-        display_name: `${m.name} (Claude Code)`,
-        created_at: MODEL_CREATED_AT,
-      }))
-      : []),
-  ];
+  const data = RADHE_FLAGSHIP_ROSTER.map(m => ({
+    type: 'model' as const,
+    id: m.id,
+    display_name: m.name,
+    created_at: MODEL_CREATED_AT,
+  }));
   res.json({ data, has_more: false, first_id: data[0]?.id ?? null, last_id: data[data.length - 1]?.id ?? null });
 });

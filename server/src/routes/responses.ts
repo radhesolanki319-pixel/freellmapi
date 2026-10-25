@@ -38,6 +38,7 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { isClientAbortError, newClientAbortError, newHedgeAbortError } from '../lib/error-classify.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
+import { resolveFlagshipModel } from '../services/anthropic-map.js';
 
 export const responsesRouter = Router();
 
@@ -663,7 +664,18 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     ?? req.headers['session-id']
     ?? req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  const requestedModelLabel = reqData.model ?? 'auto';
+  const rawModelLabel = reqData.model ?? 'auto';
+  const flagship = resolveFlagshipModel(rawModelLabel);
+  let requestedModelLabel = rawModelLabel;
+  if (flagship) {
+    if (flagship.isClaudeFamily || flagship.target === 'auto' || isAutoModel(flagship.target)) {
+      requestedModelLabel = 'auto';
+    } else {
+      const db = getDb();
+      const hasTarget = db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(flagship.target);
+      requestedModelLabel = hasTarget ? flagship.target : 'auto';
+    }
+  }
 
   // Explicit `model` field pins routing. If the catalog has no enabled row
   // matching the requested id, return 400 — silently auto-routing to a

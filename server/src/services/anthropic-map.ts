@@ -136,10 +136,90 @@ export function resolveAnthropicModel(model?: string): ResolvedAnthropicModel {
 // the gateway really will serve. The display name says where the request
 // actually goes so nobody reads the entry as hosted Claude.
 export const CLAUDE_FAMILY_ALIASES: { id: string; family: ClaudeFamily; label: string }[] = [
+  { id: 'claude-opus-5.5', family: 'opus', label: 'Claude Opus 5.5' },
+  { id: 'claude-opus-5', family: 'opus', label: 'Claude Opus 5' },
+  { id: 'claude-opus-4.8', family: 'opus', label: 'Claude Opus 4.8' },
+  { id: 'claude-opus-4.7', family: 'opus', label: 'Claude Opus 4.7' },
+  { id: 'claude-opus-4.6', family: 'opus', label: 'Claude Opus 4.6' },
+  { id: 'claude-sonnet-5', family: 'sonnet', label: 'Claude Sonnet 5' },
+  { id: 'claude-fable-5.1', family: 'default', label: 'Claude Fable 5.1' },
+  { id: 'claude-fable-5', family: 'default', label: 'Claude Fable 5' },
+  { id: 'claude-mythos-preview', family: 'default', label: 'Claude Mythos Preview' },
   { id: 'claude-opus-4-5', family: 'opus', label: 'Opus' },
   { id: 'claude-sonnet-4-5', family: 'sonnet', label: 'Sonnet' },
   { id: 'claude-haiku-4-5', family: 'haiku', label: 'Haiku' },
 ];
+
+export interface FlagshipModelDef {
+  id: string;
+  name: string;
+  ownedBy: string;
+  family: 'Gemini' | 'Claude' | 'GPT' | 'GLM' | 'Qwen' | 'DeepSeek';
+  contextWindow: number;
+  target: string;
+  isClaudeFamily?: boolean;
+}
+
+export const RADHE_FLAGSHIP_ROSTER: FlagshipModelDef[] = [
+  // 1-7: Gemini Family (7)
+  { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', ownedBy: 'google', family: 'Gemini', contextWindow: 1048576, target: 'gemini-3.8-flash' },
+  { id: 'gemini-3.7-flash', name: 'Gemini 3.7 Flash', ownedBy: 'google', family: 'Gemini', contextWindow: 1048576, target: 'gemini-3.7-flash' },
+  { id: 'gemini-3.6-flash', name: 'Gemini 3.6 Flash', ownedBy: 'google', family: 'Gemini', contextWindow: 1048576, target: 'gemini-3.6-flash' },
+  { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', ownedBy: 'google', family: 'Gemini', contextWindow: 1048576, target: 'gemini-3.5-flash' },
+  { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash-Lite', ownedBy: 'google', family: 'Gemini', contextWindow: 1048576, target: 'gemini-3.5-flash-lite' },
+  { id: 'gemini-flash-latest', name: 'Gemini Flash Latest', ownedBy: 'google', family: 'Gemini', contextWindow: 1048576, target: 'gemini-flash-latest' },
+  { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', ownedBy: 'google', family: 'Gemini', contextWindow: 1048576, target: 'gemini-3.8-flash' },
+
+  // 8-16: Claude Family (9)
+  { id: 'claude-opus-5.5', name: 'Claude Opus 5.5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-opus-5', name: 'Claude Opus 5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-opus-4.8', name: 'Claude Opus 4.8', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-opus-4.7', name: 'Claude Opus 4.7', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-opus-4.6', name: 'Claude Opus 4.6', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-fable-5.1', name: 'Claude Fable 5.1', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-fable-5', name: 'Claude Fable 5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-mythos-preview', name: 'Claude Mythos Preview', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+
+  // 17-22: GPT Family (6)
+  { id: 'gpt-6-astra', name: 'GPT-6 Astra', ownedBy: 'openai', family: 'GPT', contextWindow: 1000000, target: 'auto' },
+  { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', ownedBy: 'openai', family: 'GPT', contextWindow: 1000000, target: 'auto' },
+  { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', ownedBy: 'openai', family: 'GPT', contextWindow: 1000000, target: 'auto' },
+  { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', ownedBy: 'openai', family: 'GPT', contextWindow: 1000000, target: 'auto' },
+  { id: 'gpt-5.5-pro', name: 'GPT-5.5 Pro', ownedBy: 'openai', family: 'GPT', contextWindow: 1000000, target: 'auto' },
+  { id: 'gpt-5.5', name: 'GPT-5.5', ownedBy: 'openai', family: 'GPT', contextWindow: 1000000, target: 'auto' },
+
+  // 23-24: GLM Family (2)
+  { id: 'glm-5.3', name: 'GLM 5.3', ownedBy: 'zhipu', family: 'GLM', contextWindow: 128000, target: 'glm-5.3:free' },
+  { id: 'glm-5.2', name: 'GLM 5.2', ownedBy: 'zhipu', family: 'GLM', contextWindow: 128000, target: 'z-ai/glm-5.2' },
+
+  // 25-26: Qwen Family (2)
+  { id: 'qwen3.8-max', name: 'Qwen 3.8 Max', ownedBy: 'alibaba', family: 'Qwen', contextWindow: 1000000, target: 'qwen/qwen3.8-max:free' },
+  { id: 'qwen3.8-omni-flash', name: 'Qwen 3.8 Omni Flash', ownedBy: 'alibaba', family: 'Qwen', contextWindow: 128000, target: 'qwen/qwen3.8-omni-flash:free' },
+
+  // 27-28: DeepSeek Family (2)
+  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', ownedBy: 'deepseek', family: 'DeepSeek', contextWindow: 128000, target: 'deepseek-ai/DeepSeek-V4-Pro' },
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', ownedBy: 'deepseek', family: 'DeepSeek', contextWindow: 128000, target: 'DeepSeek-V4-Flash' },
+];
+
+export function resolveFlagshipModel(modelId?: string): FlagshipModelDef | null {
+  if (!modelId) return null;
+  const m = modelId.trim().toLowerCase();
+  return RADHE_FLAGSHIP_ROSTER.find(f => f.id.toLowerCase() === m) ?? null;
+}
+
+/** What an OpenAI-wire route should dispatch a listed Claude alias to. */
+export type ClaudeAliasDispatch =
+  | { kind: 'model'; modelId: string }
+  | { kind: 'auto' };
+
+export function resolveListedClaudeAlias(model?: string): ClaudeAliasDispatch | null {
+  const id = (model ?? '').trim().toLowerCase();
+  if (!CLAUDE_FAMILY_ALIASES.some(alias => alias.id === id)) return null;
+  const resolved = resolveAnthropicModel(id);
+  if (resolved.modelId) return { kind: 'model', modelId: resolved.modelId };
+  return { kind: 'auto' };
+}
 
 // Discovery entries for the family aliases, named after where each one routes:
 // the pinned catalog model when the operator pinned one, otherwise the router.

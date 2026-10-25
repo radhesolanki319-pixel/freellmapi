@@ -317,24 +317,49 @@ export function setStickyModel(messages: ChatMessage[], modelDbId: number, sessi
   }
 }
 
-// OpenAI-compatible /models endpoint - strictly exposes ONLY the 28 Radhe Flagship Models
+// OpenAI-compatible /models endpoint - exposes Radhe Flagship Models + active custom models
 proxyRouter.get('/models', (req: Request, res: Response) => {
   if (!requireInferenceAuth(req, res)) return;
 
+  const rosterModels = RADHE_FLAGSHIP_ROSTER.map(m => ({
+    id: m.id,
+    object: 'model',
+    created: 1715000000,
+    owned_by: m.ownedBy,
+    name: m.name,
+    context_window: m.contextWindow,
+    context_length: m.contextWindow,
+    available: true,
+    unavailable_reason: null,
+    execution_status: 'ready',
+  }));
+
+  const seenIds = new Set(rosterModels.map(m => m.id.toLowerCase()));
+  const db = getDb();
+  try {
+    const dbRows = db.prepare("SELECT model_id, display_name, platform, context_window FROM models WHERE enabled = 1").all() as any[];
+    for (const r of dbRows) {
+      if (!seenIds.has(r.model_id.toLowerCase())) {
+        seenIds.add(r.model_id.toLowerCase());
+        rosterModels.push({
+          id: r.model_id,
+          object: 'model',
+          created: 1715000000,
+          owned_by: r.platform || 'custom',
+          name: r.display_name || r.model_id,
+          context_window: r.context_window || 128000,
+          context_length: r.context_window || 128000,
+          available: true,
+          unavailable_reason: null,
+          execution_status: 'ready',
+        });
+      }
+    }
+  } catch {}
+
   res.json({
     object: 'list',
-    data: RADHE_FLAGSHIP_ROSTER.map(m => ({
-      id: m.id,
-      object: 'model',
-      created: 1715000000,
-      owned_by: m.ownedBy,
-      name: m.name,
-      context_window: m.contextWindow,
-      context_length: m.contextWindow,
-      available: true,
-      unavailable_reason: null,
-      execution_status: 'ready',
-    })),
+    data: rosterModels,
   });
 });
 
@@ -357,6 +382,27 @@ proxyRouter.get(['/models/:id', '/models/*rest'], (req: Request, res: Response) 
     });
     return;
   }
+
+  const db = getDb();
+  try {
+    const dbRow = db.prepare("SELECT model_id, display_name, platform, context_window FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1").get(requestedId) as any;
+    if (dbRow) {
+      res.json({
+        id: dbRow.model_id,
+        object: 'model',
+        created: 1715000000,
+        owned_by: dbRow.platform || 'custom',
+        name: dbRow.display_name || dbRow.model_id,
+        context_window: dbRow.context_window || 128000,
+        context_length: dbRow.context_window || 128000,
+        available: true,
+        unavailable_reason: null,
+        execution_status: 'ready',
+      });
+      return;
+    }
+  } catch {}
+
   res.status(404).json({
     error: {
       message: `Model '${requestedId}' not found. Available models: ${RADHE_FLAGSHIP_ROSTER.map(m => m.id).join(', ')}`,
@@ -1064,12 +1110,17 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
     if (flagship.isClaudeFamily) {
       const resolvedClaude = resolveAnthropicModel(clientModel);
       requestedModel = resolvedClaude.modelId || 'auto';
-    } else if (flagship.target === 'auto' || isAutoModel(flagship.target)) {
-      requestedModel = 'auto';
     } else {
       const db = getDb();
-      const hasTarget = db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(flagship.target);
-      requestedModel = hasTarget ? flagship.target : 'auto';
+      const hasDirect = clientModel ? db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(clientModel) : null;
+      if (hasDirect) {
+        requestedModel = clientModel;
+      } else if (flagship.target === 'auto' || isAutoModel(flagship.target)) {
+        requestedModel = 'auto';
+      } else {
+        const hasTarget = db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(flagship.target);
+        requestedModel = hasTarget ? flagship.target : 'auto';
+      }
     }
   }
   const max_tokens = parsed.data.max_tokens != null && parsed.data.max_tokens > 0
@@ -1501,12 +1552,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     if (flagship.isClaudeFamily) {
       const resolvedClaude = resolveAnthropicModel(clientModel);
       requestedModel = resolvedClaude.modelId || 'auto';
-    } else if (flagship.target === 'auto' || isAutoModel(flagship.target)) {
-      requestedModel = 'auto';
     } else {
       const db = getDb();
-      const hasTarget = db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(flagship.target);
-      requestedModel = hasTarget ? flagship.target : 'auto';
+      const hasDirect = clientModel ? db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(clientModel) : null;
+      if (hasDirect) {
+        requestedModel = clientModel;
+      } else if (flagship.target === 'auto' || isAutoModel(flagship.target)) {
+        requestedModel = 'auto';
+      } else {
+        const hasTarget = db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(flagship.target);
+        requestedModel = hasTarget ? flagship.target : 'auto';
+      }
     }
   }
   // Agent-tolerant knob normalization (#200): max_tokens <= 0 means "no

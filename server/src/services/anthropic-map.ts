@@ -172,7 +172,7 @@ export interface FlagshipModelDef {
 
 export const RADHE_FLAGSHIP_ROSTER: FlagshipModelDef[] = [
   { id: 'claude-fable-5.1', name: 'Claude Fable 5.1', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
-  { id: 'claude-haiku-4.5-20251001-r', name: 'Claude Haiku 4.5 (20251001-R)', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-haiku-4.5-20251001-r', name: 'Claude Haiku 4.5 (20251001-R)', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'qwen/qwen3.8-27b', isClaudeFamily: true },
   { id: 'claude-haiku-5.5', name: 'Claude Haiku 5.5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
   { id: 'claude-opus-5', name: 'Claude Opus 5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
   { id: 'claude-opus-5.5', name: 'Claude Opus 5.5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
@@ -258,7 +258,7 @@ export const RADHE_FLAGSHIP_ROSTER: FlagshipModelDef[] = [
   { id: 'minimax-m2.7', name: 'MiniMax M2.7', ownedBy: 'minimax', family: 'MiniMax', contextWindow: 200000, target: 'MiniMaxAI/MiniMax-M3.1-Flash' },
   { id: 'grok-4.5', name: 'Grok 4.5', ownedBy: 'xai', family: 'Grok', contextWindow: 200000, target: 'auto' },
   { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', ownedBy: 'google', family: 'Gemini', contextWindow: 1048576, target: 'auto' },
-  { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
+  { id: 'claude-haiku-4.5', name: 'Claude Haiku 4.5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'qwen/qwen3.8-27b', isClaudeFamily: true },
   { id: 'claude-opus-4.5', name: 'Claude Opus 4.5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
   { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5', ownedBy: 'anthropic', family: 'Claude', contextWindow: 200000, target: 'auto', isClaudeFamily: true },
   { id: 'glm-5', name: 'GLM 5', ownedBy: 'zhipu', family: 'GLM', contextWindow: 128000, target: 'auto' },

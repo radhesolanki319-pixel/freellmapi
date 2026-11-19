@@ -1064,7 +1064,13 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   if (flagship) {
     if (flagship.isClaudeFamily) {
       const resolvedClaude = resolveAnthropicModel(clientModel);
-      requestedModel = resolvedClaude.modelId || 'auto';
+      if (resolvedClaude.modelId) {
+        requestedModel = resolvedClaude.modelId;
+      } else if (flagship.target && flagship.target !== 'auto' && !isAutoModel(flagship.target)) {
+        requestedModel = flagship.target;
+      } else {
+        requestedModel = 'auto';
+      }
     } else {
       const db = getDb();
       const hasDirect = clientModel ? db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(clientModel) : null;
@@ -1509,7 +1515,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (flagship) {
     if (flagship.isClaudeFamily) {
       const resolvedClaude = resolveAnthropicModel(clientModel);
-      requestedModel = resolvedClaude.modelId || 'auto';
+      if (resolvedClaude.modelId) {
+        requestedModel = resolvedClaude.modelId;
+      } else if (flagship.target && flagship.target !== 'auto' && !isAutoModel(flagship.target)) {
+        requestedModel = flagship.target;
+      } else {
+        requestedModel = 'auto';
+      }
     } else {
       const db = getDb();
       const hasDirect = clientModel ? db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(clientModel) : null;

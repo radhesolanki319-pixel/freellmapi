@@ -457,13 +457,24 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
     : body.model;
 
   const flagship = resolveFlagshipModel(routedModel);
-  if (flagship && !flagship.isClaudeFamily) {
-    if (flagship.target === 'auto') {
-      routedModel = 'auto';
+  if (flagship) {
+    if (flagship.isClaudeFamily) {
+      const resolvedClaude = resolveAnthropicModel(routedModel);
+      if (resolvedClaude.modelId) {
+        routedModel = resolvedClaude.modelId;
+      } else if (flagship.target && flagship.target !== 'auto' && !isAutoModel(flagship.target)) {
+        routedModel = flagship.target;
+      } else {
+        routedModel = 'auto';
+      }
     } else {
-      const db = getDb();
-      const hasTarget = db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(flagship.target);
-      routedModel = hasTarget ? flagship.target : 'auto';
+      if (flagship.target === 'auto') {
+        routedModel = 'auto';
+      } else {
+        const db = getDb();
+        const hasTarget = db.prepare('SELECT 1 FROM models WHERE model_id = ? AND enabled = 1 LIMIT 1').get(flagship.target);
+        routedModel = hasTarget ? flagship.target : 'auto';
+      }
     }
   }
   // The Anthropic wire format requires max_tokens, but OUR default injection

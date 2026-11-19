@@ -50,6 +50,8 @@ function isAutoModel(modelId: string | undefined): boolean {
   return (
     lower === AUTO_MODEL_ID ||
     lower.startsWith(`${AUTO_MODEL_ID}:`) ||
+    lower === 'auto-fusion' ||
+    lower.startsWith('auto-fusion:') ||
     lower === 'gpt-6-astra' ||
     lower === 'openai/gpt-6-astra' ||
     lower.includes('6-astra') ||

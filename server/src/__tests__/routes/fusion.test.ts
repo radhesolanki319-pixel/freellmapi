@@ -3,7 +3,7 @@ import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
-import { isFusionModel, fusionConfigSchema, familyKey, diversifyChain } from '../../services/fusion.js';
+import { isFusionModel, isAutoFusionModel, classifyTaskComplexity, fusionConfigSchema, familyKey, diversifyChain } from '../../services/fusion.js';
 import { getOrderedFusionChain, setRoutingStrategy, getRoutingStrategy, type FusionCandidate } from '../../services/router.js';
 import { setCooldown } from '../../services/ratelimit.js';
 
@@ -107,6 +107,69 @@ describe('isFusionModel', () => {
     expect(isFusionModel('auto')).toBe(false);
     expect(isFusionModel('gpt-oss-120b')).toBe(false);
     expect(isFusionModel(undefined)).toBe(false);
+  });
+});
+
+describe('isAutoFusionModel', () => {
+  it('matches auto-fusion, auto:fusion, fusion:auto, and prefixes', () => {
+    expect(isAutoFusionModel('auto-fusion')).toBe(true);
+    expect(isAutoFusionModel('AUTO-FUSION')).toBe(true);
+    expect(isAutoFusionModel('auto-fusion:smart')).toBe(true);
+    expect(isAutoFusionModel('auto:fusion')).toBe(true);
+    expect(isAutoFusionModel('fusion:auto')).toBe(true);
+    expect(isAutoFusionModel('fusion-auto')).toBe(true);
+    expect(isAutoFusionModel('auto')).toBe(false);
+    expect(isAutoFusionModel('fusion')).toBe(false);
+    expect(isAutoFusionModel(undefined)).toBe(false);
+  });
+});
+
+describe('classifyTaskComplexity', () => {
+  it('classifies simple greetings as fast auto turns', () => {
+    const res = classifyTaskComplexity([{ role: 'user', content: 'Hello' }]);
+    expect(res.isComplex).toBe(false);
+    expect(res.recommendedModel).toBe('auto');
+  });
+
+  it('classifies short operational commands as fast auto turns', () => {
+    const res = classifyTaskComplexity([{ role: 'user', content: 'git status check karo' }]);
+    expect(res.isComplex).toBe(false);
+    expect(res.recommendedModel).toBe('auto');
+  });
+
+  it('classifies tool execution intermediate steps as fast auto turns', () => {
+    const res = classifyTaskComplexity([
+      { role: 'user', content: 'check files' },
+      { role: 'assistant', content: '', tool_calls: [{ id: '1', type: 'function', function: { name: 'ls', arguments: '{}' } }] },
+      { role: 'tool', content: 'file1.txt\nfile2.txt' },
+    ]);
+    expect(res.isComplex).toBe(false);
+    expect(res.recommendedModel).toBe('auto');
+  });
+
+  it('classifies architectural and security audit tasks as complex fusion turns', () => {
+    const res = classifyTaskComplexity([
+      { role: 'user', content: 'Please perform a thorough security audit and threat model on our distributed microservices architecture' },
+    ]);
+    expect(res.isComplex).toBe(true);
+    expect(res.recommendedModel).toBe('fusion');
+  });
+
+  it('classifies explicit multi-model consensus requests as complex fusion turns', () => {
+    const res = classifyTaskComplexity([
+      { role: 'user', content: 'Use multi-model consensus to synthesize the best tradeoffs between Redis and Memcached' },
+    ]);
+    expect(res.isComplex).toBe(true);
+    expect(res.recommendedModel).toBe('fusion');
+  });
+
+  it('classifies requests with reasoning_effort high as complex fusion turns', () => {
+    const res = classifyTaskComplexity(
+      [{ role: 'user', content: 'Explain quantum entanglement' }],
+      { reasoning_effort: 'high' }
+    );
+    expect(res.isComplex).toBe(true);
+    expect(res.recommendedModel).toBe('fusion');
   });
 });
 

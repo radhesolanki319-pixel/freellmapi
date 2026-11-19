@@ -20,7 +20,7 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { convertDocumentBlock, documentRejectionMessage } from '../lib/anthropic-documents.js';
 import { isClientAbortError, newClientAbortError, newHedgeAbortError, isUpstreamClassificationOutput } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
-import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
+import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel, isAutoModel } from './proxy.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
 import { routedViaValue } from '../lib/header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';

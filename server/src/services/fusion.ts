@@ -22,11 +22,133 @@ import type { CompletionOptions } from '../providers/base.js';
 // The virtual model id that triggers multi-model synthesis. Mirrors how
 // `auto` is a virtual id the router intercepts (see routes/proxy.ts).
 export const FUSION_MODEL_ID = 'fusion';
+export const AUTO_FUSION_MODEL_ID = 'auto-fusion';
 
 export function isFusionModel(modelId: string | undefined): boolean {
   if (!modelId) return false;
   const lower = modelId.toLowerCase();
   return lower === FUSION_MODEL_ID || lower.startsWith(`${FUSION_MODEL_ID}:`);
+}
+
+export function isAutoFusionModel(modelId: string | undefined): boolean {
+  if (!modelId) return false;
+  const lower = modelId.toLowerCase();
+  return (
+    lower === AUTO_FUSION_MODEL_ID ||
+    lower.startsWith(`${AUTO_FUSION_MODEL_ID}:`) ||
+    lower === 'auto:fusion' ||
+    lower === 'fusion:auto' ||
+    lower === 'fusion-auto'
+  );
+}
+
+export interface TaskClassification {
+  isComplex: boolean;
+  score: number;
+  reason: string;
+  recommendedModel: 'fusion' | 'auto';
+}
+
+/**
+ * Smart Task Classifier for Auto-Fusion:
+ * Dynamically analyzes incoming messages & options to decide whether the turn
+ * requires full multi-model consensus / synthesis (Fusion) or should be
+ * routed to the ultra-fast SOTA model (Auto, e.g. Groq Qwen 3.8 27B / Mistral Codestral).
+ */
+export function classifyTaskComplexity(
+  messages: ChatMessage[],
+  options?: {
+    tools?: unknown[];
+    tool_choice?: unknown;
+    reasoning_effort?: string;
+    thinking?: unknown;
+  },
+): TaskClassification {
+  let score = 0;
+  const reasons: string[] = [];
+
+  const userMessages = (messages || []).filter(m => m.role === 'user');
+  const lastUserMsg = userMessages[userMessages.length - 1];
+  const lastUserText = contentToString(lastUserMsg?.content ?? '').trim();
+  const lowerText = lastUserText.toLowerCase();
+
+  // If this turn is an intermediate step in a tool-calling agent loop, speed is critical
+  // and tools cannot be synthesized across models anyway (the first tool_call wins).
+  const lastMsg = (messages || [])[(messages || []).length - 1];
+  const isToolStep = lastMsg && (lastMsg.role === 'tool' || (lastMsg as any).role === 'function');
+  if (isToolStep) {
+    score -= 40;
+    reasons.push('active tool step');
+  }
+
+  // 1. Explicit Fusion / Multi-Model intent
+  const explicitFusionRegex = /\b(fusion|multi[- ]?model|consensus|synthesize|blend answers|panel deliberation)\b/i;
+  if (explicitFusionRegex.test(lowerText)) {
+    score += 50;
+    reasons.push('explicit fusion requested');
+  }
+
+  // 2. High Complexity Keywords (Architecture, Security, Deep Analysis, Logic)
+  const complexKeywordsRegex = /\b(architecture|system design|scalability|threat model|security audit|vulnerability|penetration test|formal verification|code review|refactor architecture|root cause analysis|post-mortem|trade-?offs|pros and cons|step[- ]by[- ]step (reasoning|proof)|mathematical proof|comprehensive (breakdown|analysis))\b/i;
+  if (complexKeywordsRegex.test(lowerText)) {
+    score += 35;
+    reasons.push('complex architecture/security/analysis');
+  }
+
+  // 3. Reasoning effort / thinking parameter
+  if (options?.reasoning_effort === 'high' || options?.reasoning_effort === 'medium' || options?.thinking) {
+    score += 30;
+    reasons.push('reasoning effort enabled');
+  }
+
+  // 4. Greetings and casual chit-chat (Fast Agile Auto)
+  const greetingRegex = /^(hi|hello|hey|namaste|kya haal hai|kaise ho|good (morning|afternoon|evening|night)|yo|sup|test|ping)[\s.!?,]*$/i;
+  if (greetingRegex.test(lowerText)) {
+    score -= 60;
+    reasons.push('greeting');
+  }
+
+  // 5. Short operational / bash / system inspection commands
+  const operationalCmdRegex = /^(run|exec|execute|cat|ls|cd|pwd|git|mkdir|touch|read|write|check status|status|version)[\s:.]/i;
+  const wordCount = lowerText.split(/\s+/).filter(Boolean).length;
+  if (operationalCmdRegex.test(lowerText) && wordCount < 30) {
+    score -= 40;
+    reasons.push('short operational command');
+  }
+
+  // 6. Word count and structural depth
+  if (wordCount >= 150 || lastUserText.length >= 700) {
+    score += 25;
+    reasons.push('high token/content volume');
+  } else if (wordCount < 25 && !complexKeywordsRegex.test(lowerText) && !explicitFusionRegex.test(lowerText)) {
+    score -= 30;
+    reasons.push('concise query');
+  }
+
+  // Code blocks
+  if ((lastUserText.match(/```/g) || []).length >= 2) {
+    score += 15;
+    reasons.push('contains code blocks');
+  }
+
+  // Multi-part inquiries
+  const questionCount = (lastUserText.match(/\?/g) || []).length;
+  const numberedListCount = (lastUserText.match(/\b\d+\.\s/g) || []).length;
+  if (questionCount >= 3 || numberedListCount >= 3) {
+    score += 15;
+    reasons.push('multi-part inquiry');
+  }
+
+  const isComplex = score >= 30;
+  const recommendedModel: 'fusion' | 'auto' = isComplex ? 'fusion' : 'auto';
+  const reason = reasons.length > 0 ? reasons.join(', ') : (isComplex ? 'complex task' : 'fast task');
+
+  return {
+    isComplex,
+    score,
+    reason,
+    recommendedModel,
+  };
 }
 
 // Tag every panel/judge sub-call with this in the request log so fusion traffic

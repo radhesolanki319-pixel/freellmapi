@@ -21,7 +21,7 @@ import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValida
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
-import { isFusionModel, runFusion, fusionConfigSchema, FusionError, FUSION_MODEL_ID } from '../services/fusion.js';
+import { isFusionModel, isAutoFusionModel, classifyTaskComplexity, type TaskClassification, runFusion, fusionConfigSchema, FusionError, FUSION_MODEL_ID } from '../services/fusion.js';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, isClientAbortError, newClientAbortError, newHedgeAbortError, isUpstreamClassificationOutput } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { observeServedModel } from '../lib/served-model.js';
@@ -47,12 +47,14 @@ export const proxyRouter = Router();
 // `model` entirely.
 const AUTO_MODEL_ID = 'auto';
 
-function isAutoModel(modelId: string | undefined): boolean {
+export function isAutoModel(modelId: string | undefined): boolean {
   if (!modelId) return true;
   const lower = modelId.toLowerCase();
   return (
     lower === AUTO_MODEL_ID ||
     lower.startsWith(`${AUTO_MODEL_ID}:`) ||
+    lower === 'auto-fusion' ||
+    lower.startsWith('auto-fusion:') ||
     lower === 'gpt-6-astra' ||
     lower === 'openai/gpt-6-astra' ||
     lower.includes('6-astra') ||
@@ -317,30 +319,87 @@ export function setStickyModel(messages: ChatMessage[], modelDbId: number, sessi
   }
 }
 
-// OpenAI-compatible /models endpoint - strictly exposes ONLY Radhe's Flagship Models
+// OpenAI-compatible /models endpoint - strictly exposes ONLY Radhe's Flagship Models + Virtual Models
 proxyRouter.get('/models', (req: Request, res: Response) => {
   if (!requireInferenceAuth(req, res)) return;
 
-  res.json({
-    object: 'list',
-    data: RADHE_FLAGSHIP_ROSTER.map(m => ({
-      id: m.id,
+  const virtuals = [
+    {
+      id: 'auto-fusion',
       object: 'model',
       created: 1715000000,
-      owned_by: m.ownedBy,
-      name: m.name,
-      context_window: m.contextWindow,
-      context_length: m.contextWindow,
+      owned_by: 'system',
+      name: 'Auto-Fusion (Smart Task-Based Hybrid)',
+      context_window: 262144,
+      context_length: 262144,
       available: true,
       unavailable_reason: null,
       execution_status: 'ready',
-    })),
+    },
+    {
+      id: 'auto',
+      object: 'model',
+      created: 1715000000,
+      owned_by: 'system',
+      name: 'Auto (Fastest Available SOTA)',
+      context_window: 262144,
+      context_length: 262144,
+      available: true,
+      unavailable_reason: null,
+      execution_status: 'ready',
+    },
+    {
+      id: 'fusion',
+      object: 'model',
+      created: 1715000000,
+      owned_by: 'system',
+      name: 'Fusion (Multi-Model Synthesis)',
+      context_window: 262144,
+      context_length: 262144,
+      available: true,
+      unavailable_reason: null,
+      execution_status: 'ready',
+    },
+  ];
+
+  res.json({
+    object: 'list',
+    data: [
+      ...virtuals,
+      ...RADHE_FLAGSHIP_ROSTER.map(m => ({
+        id: m.id,
+        object: 'model',
+        created: 1715000000,
+        owned_by: m.ownedBy,
+        name: m.name,
+        context_window: m.contextWindow,
+        context_length: m.contextWindow,
+        available: true,
+        unavailable_reason: null,
+        execution_status: 'ready',
+      })),
+    ],
   });
 });
 
 proxyRouter.get(['/models/:id', '/models/*rest'], (req: Request, res: Response) => {
   if (!requireInferenceAuth(req, res)) return;
   const requestedId = req.params.id || (req.params as any)[0] || '';
+  if (requestedId === 'auto-fusion' || requestedId === 'auto' || requestedId === 'fusion') {
+    res.json({
+      id: requestedId,
+      object: 'model',
+      created: 1715000000,
+      owned_by: 'system',
+      name: requestedId === 'auto-fusion' ? 'Auto-Fusion (Smart Task-Based Hybrid)' : (requestedId === 'auto' ? 'Auto (Fastest Available SOTA)' : 'Fusion (Multi-Model Synthesis)'),
+      context_window: 262144,
+      context_length: 262144,
+      available: true,
+      unavailable_reason: null,
+      execution_status: 'ready',
+    });
+    return;
+  }
   const found = resolveFlagshipModel(requestedId);
   if (found) {
     res.json({
@@ -1745,6 +1804,28 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   }
   max_tokens = budgetCheck.maxTokens;
 
+  // ── Auto-Fusion: Smart Task-Based Hybrid Routing ────────────────────────────
+  // When model is "auto-fusion" (or auto:fusion), dynamically classify the task:
+  // - Fast / Agile turns (greetings, simple queries, tool steps, commands) -> route to "auto" (Fast SOTA, ~400ms)
+  // - Deep / Complex turns (architecture, security, deep reasoning, multi-part) -> route to "fusion"
+  const isAutoFusion = isAutoFusionModel(requestedModel);
+  let autoFusionClass: TaskClassification | undefined;
+  if (isAutoFusion) {
+    autoFusionClass = classifyTaskComplexity(messages, {
+      tools,
+      tool_choice,
+      reasoning_effort: (samplingParams as any)?.reasoning_effort,
+      thinking: (samplingParams as any)?.thinking,
+    });
+    res.setHeader('X-Auto-Fusion-Decision', `${autoFusionClass.recommendedModel} (${autoFusionClass.reason})`);
+    res.setHeader('X-Auto-Fusion-Score', autoFusionClass.score.toString());
+    if (autoFusionClass.isComplex) {
+      requestedModel = FUSION_MODEL_ID;
+    } else {
+      requestedModel = AUTO_MODEL_ID;
+    }
+  }
+
   // ── Fusion: multi-model synthesis ──────────────────────────────────────────
   // The virtual "fusion" model fans the prompt out to a panel of diverse models
   // in parallel, then a judge synthesizes one answer. It routes each panel/judge
@@ -1767,7 +1848,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       res.setHeader('Connection', 'keep-alive');
       const writeFrame = (o: unknown) => { try { res.write(`data: ${JSON.stringify(o)}\n\n`); } catch { /* socket gone */ } };
       const streamId = `fusion-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-      const base = { id: streamId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: FUSION_MODEL_ID };
+      const base = { id: streamId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: isAutoFusion ? requestedModelLabel : FUSION_MODEL_ID };
       // Track whether the judge already streamed content so we don't re-emit it.
       let answerStarted = false;
       try {
@@ -1851,7 +1932,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         }
       }
       res.setHeader('X-Routed-Via', safeHeaderValue(routedVia));
-      res.json({ ...response, execution_id: requestGroupId });
+      res.json({ ...response, model: isAutoFusion ? requestedModelLabel : response.model, execution_id: requestGroupId });
     } catch (err: any) {
       if (err instanceof FusionError) {
         res.status(err.status).json({ error: { message: err.message, type: err.status === 429 ? 'rate_limit_error' : 'invalid_request_error' }, execution_id: requestGroupId });

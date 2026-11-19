@@ -73,6 +73,7 @@ export const MODEL_PRICING: PricingRow[] = [
   ['groq', 'openai/gpt-oss-20b', 0.029, 0.14],
   ['groq', 'openai/gpt-oss-safeguard-20b', 0.075, 0.30],
   ['groq', 'qwen/qwen3-32b', 0.08, 0.28],
+  ['groq', 'qwen/qwen3.8-27b', 0.08, 0.28],
 
   // Hugging Face Inference
   ['huggingface', 'Qwen/Qwen3-Coder-Next', 0.11, 0.80],
@@ -91,6 +92,14 @@ export const MODEL_PRICING: PricingRow[] = [
 
   // Mistral (official La Plateforme prices; Magistral per official page)
   ['mistral', 'codestral-latest', 0.30, 0.90],
+  ['mistral', 'ministral-14b-latest', 0.10, 0.10],
+  ['mistral', 'ministral-8b-latest', 0.10, 0.10],
+  ['siliconflow', 'deepseek-ai/DeepSeek-V4.1-Flash', 0.14, 0.28],
+  ['siliconflow', 'zai-org/GLM-5.3-Flash', 0.06, 0.40],
+  ['siliconflow', 'Qwen/Qwen3.8-27B', 0.08, 0.28],
+  ['siliconflow', 'moonshotai/Kimi-K3.1-Pro', 0.50, 2.00],
+  ['siliconflow', 'MiniMaxAI/MiniMax-M3.1-Flash', 0.20, 0.80],
+  ['siliconflow', 'deepseek-ai/DeepSeek-V4-Flash-Vision-Exp', 0.14, 0.28],
   ['mistral', 'devstral-latest', 0.40, 2.00],
   ['mistral', 'magistral-medium-latest', 2.00, 5.00],
   ['mistral', 'ministral-8b-latest', 0.15, 0.15],

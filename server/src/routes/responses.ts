@@ -708,7 +708,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       const sticky = getStickyModel(messages, sessionIdHeader, requestedModelLabel);
       preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
     } else {
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModelLabel) as { id: number } | undefined;
+      let enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModelLabel) as { id: number } | undefined;
+      if (!enabled && requestedModelLabel) {
+        enabled = db.prepare('SELECT id FROM models WHERE (model_id LIKE ? OR LOWER(display_name) LIKE ?) AND enabled = 1 LIMIT 1').get(`%${requestedModelLabel}%`, `%${requestedModelLabel.toLowerCase()}%`) as { id: number } | undefined;
+      }
       if (enabled) {
         preferredModel = enabled.id;
       } else {

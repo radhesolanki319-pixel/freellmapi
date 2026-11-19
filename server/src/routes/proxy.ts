@@ -1145,7 +1145,10 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         return;
       }
     } else {
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      let enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      if (!enabled && requestedModel) {
+        enabled = db.prepare('SELECT id FROM models WHERE (model_id LIKE ? OR LOWER(display_name) LIKE ?) AND enabled = 1 LIMIT 1').get(`%${requestedModel}%`, `%${requestedModel.toLowerCase()}%`) as { id: number } | undefined;
+      }
       if (enabled) {
         preferredModel = enabled.id;
       } else {
@@ -2064,7 +2067,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
     } else {
       // Unify OFF, or an id that isn't in the catalog: legacy single-row pin.
-      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      let enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      if (!enabled && requestedModel) {
+        enabled = db.prepare('SELECT id FROM models WHERE (model_id LIKE ? OR LOWER(display_name) LIKE ?) AND enabled = 1 LIMIT 1').get(`%${requestedModel}%`, `%${requestedModel.toLowerCase()}%`) as { id: number } | undefined;
+      }
       if (enabled) {
         preferredModel = enabled.id;
       } else {

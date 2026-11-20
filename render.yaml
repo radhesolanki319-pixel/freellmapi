@@ -18,3 +18,19 @@ services:
         value: 3001
       - key: HOST
         value: 0.0.0.0
+      - key: UV_THREADPOOL_SIZE
+        value: "64"
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=512"
+      - key: DEFAULT_ROUTING_STRATEGY
+        value: "fastest"
+      - key: ROUTING_STRATEGY
+        value: "fastest"
+      - key: FALLBACK_TIME_BUDGET_MS
+        value: "10000"
+      - key: PROVIDER_TIMEOUT_DEFAULT
+        value: "5000"
+      - key: PROVIDER_STREAM_STALL_TIMEOUT_MS
+        value: "10000"
+      - key: REASONING_HOLD_MAX_MS
+        value: "1500"

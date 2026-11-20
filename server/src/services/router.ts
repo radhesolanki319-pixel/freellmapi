@@ -522,6 +522,10 @@ export const EXPLORE_MIN_SAMPLES = 5;
 const VALID_STRATEGIES: RoutingStrategy[] = ['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom', 'decision'];
 
 export function getRoutingStrategy(): RoutingStrategy {
+  const envStrategy = (process.env.ROUTING_STRATEGY || process.env.DEFAULT_ROUTING_STRATEGY) as RoutingStrategy | undefined;
+  if (envStrategy && VALID_STRATEGIES.includes(envStrategy)) {
+    return envStrategy;
+  }
   const raw = getSetting(STRATEGY_KEY);
   return (raw && VALID_STRATEGIES.includes(raw as RoutingStrategy))
     ? (raw as RoutingStrategy)

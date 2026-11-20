@@ -171,7 +171,7 @@ function benchKeyAcrossPlatform(
 // 0 disables the budget entirely.
 // Precedence mirrors the response cache: the settings-table value wins when
 // present (runtime-tunable), then the env var, then the default.
-export const DEFAULT_FALLBACK_TIME_BUDGET_MS = 45_000;
+export const DEFAULT_FALLBACK_TIME_BUDGET_MS = 10_000;
 
 // #1642: streaming surfaces hold reasoning-only output uncommitted so a dead
 // attempt fails over invisibly, but the client hears nothing meanwhile and
@@ -179,7 +179,8 @@ export const DEFAULT_FALLBACK_TIME_BUDGET_MS = 45_000;
 // reasoning this long it has proven alive, so it commits (headers, status and
 // X-Routed-Via for THIS attempt) and keeps the stream audibly alive; a later
 // failure takes the surface's normal mid-stream error path.
-export const REASONING_HOLD_MAX_MS = 15_000;
+// Lowered to 1,500ms (configurable via REASONING_HOLD_MAX_MS) so thinking models stream instantly!
+export const REASONING_HOLD_MAX_MS = Number(process.env.REASONING_HOLD_MAX_MS) || 1_500;
 // Share of the wall-clock budget an aborted attempt must have been silent for
 // before the hedge abort counts as provider health rather than bad luck. An
 // attempt late in a ladder inherits only the scraps of the budget its

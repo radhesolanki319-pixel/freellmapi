@@ -49,10 +49,11 @@ export function providerTimeoutEnvName(platform: string): string {
  * "no timeout" — callers must skip their abort timer for 0, never schedule
  * setTimeout(0). */
 export function providerTimeoutMs(platform: string, defaultMs: number): number {
-  return parseTimeoutEnv(providerTimeoutEnvName(platform), defaultMs);
+  const globalDefault = parseTimeoutEnv('PROVIDER_TIMEOUT_DEFAULT', defaultMs);
+  return parseTimeoutEnv(providerTimeoutEnvName(platform), globalDefault);
 }
 
-export const DEFAULT_STREAM_STALL_TIMEOUT_MS = 90_000;
+export const DEFAULT_STREAM_STALL_TIMEOUT_MS = 15_000;
 
 export function streamStallTimeoutEnvName(platform: string): string {
   return `PROVIDER_STREAM_STALL_TIMEOUT_${platform.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;

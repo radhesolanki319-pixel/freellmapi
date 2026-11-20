@@ -53,15 +53,15 @@ export const BANDIT_PRESETS: Record<PresetStrategy, RoutingWeights> = {
   // model that keeps failing doesn't win.
   smartest: { reliability: 0.35, speed: 0.1, intelligence: 0.55 },
   // Speed leads; reliability keeps a fast-but-broken model from winning.
-  fastest: { reliability: 0.35, speed: 0.55, intelligence: 0.1 },
+  fastest: { reliability: 0.15, speed: 0.80, intelligence: 0.05 },
   // Reliability dominates — for clients that just want it to work.
   reliable: { reliability: 0.7, speed: 0.15, intelligence: 0.15 },
 };
 
-// Analytics-driven routing is on by default ('balanced'). Operators who want the
-// old hand-ordered chain can switch the strategy to 'priority' from the
-// dashboard or PUT /api/fallback/routing.
-export const DEFAULT_STRATEGY: RoutingStrategy = 'balanced';
+// Analytics-driven routing defaults to 'fastest' for instant response and ultra-low TTFB.
+// Can be customized via DEFAULT_ROUTING_STRATEGY env or dashboard.
+export const DEFAULT_STRATEGY: RoutingStrategy =
+  (process.env.DEFAULT_ROUTING_STRATEGY as RoutingStrategy) || 'fastest';
 
 // ── Time-of-day dynamic ranking (#760) ─────────────────────────────────────
 // During an operator-declared peak window free relays are congested, so a

@@ -4,12 +4,14 @@ import {
   getCustomWeights, setCustomWeights, getExploreEnabled, setExploreEnabled,
   getCommunityPrior, setCommunityPriors, getCommunityPriorEnabled, setCommunityPriorEnabled,
   getPeakHoursConfig, setPeakHoursConfig,
+  setMinReliabilityFloor, applyReliabilityFloor,
 } from '../../services/router.js';
 import { BANDIT_PRESETS, DEFAULT_PEAK_HOURS } from '../../services/scoring.js';
 import { resetModelWeightOverrides } from '../../services/model-weight-overrides.js';
 import * as ratelimit from '../../services/ratelimit.js';
 import { getDb, initDb } from '../../db/index.js';
 import { addToActiveChain } from '../helpers/chain.js';
+import { benchForTools, resetToolCapability, toolCapabilityKey } from '../../lib/tool-capability.js';
 
 vi.mock('../../services/ratelimit.js', async () => {
   const actual = await vi.importActual('../../services/ratelimit.js');
@@ -489,5 +491,123 @@ describe('bandit router', () => {
     // on the number the user actually sees: it must move by at least 2 points.
     const shown = (v: number) => Math.round(v * 100);
     expect(shown(after.intelligence)).toBeGreaterThanOrEqual(shown(before.intelligence) + 2);
+  });
+});
+
+// #1230: a model that keeps answering tool requests with a 400 is tried LAST
+// for tool requests. Soft preference only: it never empties the pool and it
+// never affects requests without tools.
+describe('tool-rejecting models are deferred for tool requests (#1230)', () => {
+  beforeEach(() => {
+    process.env.DEV_MODE = 'true';
+    process.env.NODE_ENV = 'test';
+    initDb(':memory:');
+    getDb().exec('DELETE FROM fallback_config; DELETE FROM api_keys; DELETE FROM models; DELETE FROM requests;');
+    vi.clearAllMocks();
+    (ratelimit.canMakeRequest as any).mockReturnValue(true);
+    (ratelimit.canUseTokens as any).mockReturnValue(true);
+    (ratelimit.isOnCooldown as any).mockReturnValue(false);
+    resetToolCapability();
+    setRoutingStrategy('priority');
+    setExploreEnabled(false);
+  });
+  afterEach(() => { resetToolCapability(); });
+
+  const seed = () => {
+    const first = addModel({ platform: 'google', modelId: 'first', name: 'First', intelligenceRank: 1, sizeLabel: 'Large', budget: '~1M', priority: 1 });
+    addModel({ platform: 'groq', modelId: 'second', name: 'Second', intelligenceRank: 2, sizeLabel: 'Large', budget: '~1M', priority: 2 });
+    return first;
+  };
+  const route = (requireTools: boolean, preferred?: number) => routeRequest(100, undefined, preferred, false, requireTools).modelId;
+
+  it('keeps the operator order until a model is benched', () => {
+    seed();
+    expect(route(true)).toBe('first');
+  });
+
+  it('tries the benched model last on a tool request', () => {
+    seed();
+    benchForTools(toolCapabilityKey('google', 'first', ''));
+    expect(route(true)).toBe('second');
+  });
+
+  it('leaves requests without tools alone', () => {
+    seed();
+    benchForTools(toolCapabilityKey('google', 'first', ''));
+    expect(route(false)).toBe('first');
+  });
+
+  it('still routes to a benched model when it is the only one left', () => {
+    seed();
+    benchForTools(toolCapabilityKey('google', 'first', ''));
+    benchForTools(toolCapabilityKey('groq', 'second', ''));
+    // Everything is deferred, so the original order is what remains.
+    expect(route(true)).toBe('first');
+  });
+
+  it('an explicit pin keeps its place', () => {
+    const first = seed();
+    benchForTools(toolCapabilityKey('google', 'first', ''));
+    expect(route(true, first)).toBe('first');
+  });
+});
+
+describe('reliability floor filter', () => {
+  beforeEach(() => {
+    process.env.DEV_MODE = 'true';
+    process.env.NODE_ENV = 'test';
+    initDb(':memory:');
+    getDb().exec('DELETE FROM fallback_config; DELETE FROM api_keys; DELETE FROM models; DELETE FROM requests;');
+    vi.clearAllMocks();
+    (ratelimit.canMakeRequest as any).mockReturnValue(true);
+    (ratelimit.canUseTokens as any).mockReturnValue(true);
+    (ratelimit.isOnCooldown as any).mockReturnValue(false);
+    // isolation: floor off by default for every test
+    setMinReliabilityFloor(null);
+  });
+
+  afterEach(() => {
+    setMinReliabilityFloor(null);
+  });
+
+  it('drops a well-observed flaky model below the floor', () => {
+    addModel({ platform: 'google', modelId: 'good', name: 'Good', intelligenceRank: 3, sizeLabel: 'Large', budget: '~50M', priority: 1 });
+    addModel({ platform: 'groq', modelId: 'flaky', name: 'Flaky', intelligenceRank: 3, sizeLabel: 'Large', budget: '~50M', priority: 2 });
+    addHistory('google', 'good', { successes: 60, failures: 1 });   // ~98% → above 0.8
+    addHistory('groq', 'flaky', { successes: 5, failures: 40 });    // ~11% → below 0.8
+    setRoutingStrategy('balanced');
+    setMinReliabilityFloor(0.8);
+    refreshStatsCache(getDb(), true);
+    const counts = pickCounts(300);
+    expect(counts['good'] ?? 0).toBe(300); // flaky never selected
+    expect(counts['flaky'] ?? 0).toBe(0);
+  });
+
+  it('keeps an under-observed model despite a low gut-feel success rate', () => {
+    addModel({ platform: 'google', modelId: 'seen', name: 'Seen', intelligenceRank: 3, sizeLabel: 'Large', budget: '~50M', priority: 1 });
+    addModel({ platform: 'groq', modelId: 'fresh', name: 'Fresh', intelligenceRank: 3, sizeLabel: 'Large', budget: '~50M', priority: 2 });
+    addHistory('google', 'seen', { successes: 60, failures: 1 });
+    // 'fresh' has no history at all → fewer than EXPLORE_MIN_SAMPLES samples
+    setMinReliabilityFloor(0.9);
+    refreshStatsCache(getDb(), true);
+    const chain = [
+      { platform: 'google', model_id: 'seen', endpoint_scope: '' },
+      { platform: 'groq', model_id: 'fresh', endpoint_scope: '' },
+    ] as any[];
+    const survivors = applyReliabilityFloor(chain).map(e => e.model_id);
+    expect(survivors).toContain('seen');  // well-observed, above floor
+    expect(survivors).toContain('fresh'); // under-observed → never dropped
+  });
+
+  it('never empties the whole chain — falls back to the full chain when all fail the floor', () => {
+    addModel({ platform: 'google', modelId: 'a', name: 'A', intelligenceRank: 3, sizeLabel: 'Large', budget: '~50M', priority: 1 });
+    addModel({ platform: 'groq', modelId: 'b', name: 'B', intelligenceRank: 3, sizeLabel: 'Large', budget: '~50M', priority: 2 });
+    addHistory('google', 'a', { successes: 1, failures: 60 }); // below 0.99
+    addHistory('groq', 'b', { successes: 1, failures: 60 });   // below 0.99
+    setRoutingStrategy('balanced');
+    setMinReliabilityFloor(0.99);
+    refreshStatsCache(getDb(), true);
+    const counts = pickCounts(100);
+    expect((counts['a'] ?? 0) + (counts['b'] ?? 0)).toBe(100); // still routes somewhere
   });
 });

@@ -16,8 +16,7 @@
 // Forward-by-default: most OpenAI-compatible providers ignore unknown body
 // fields, so the default is to send everything and let the per-platform
 // droplist name the documented exceptions (Mistral 422s on unknown keys,
-// Groq 400s on the logprobs family, Azure-backed GitHub Models rejects
-// non-Azure knobs). A provider that still 400s fails over like any other
+// Groq 400s on the logprobs family). A provider that still 400s fails over like any other
 // provider-invalid request and shows up in the attempt trail — and its
 // droplist entry is one line to add.
 
@@ -233,15 +232,27 @@ export interface PlatformParamPolicy {
   maxTokensCap?: number;
 }
 
-/** GitHub Models' own output-token ceiling: asking for more 400s ("max_tokens
- *  is too large"), so the request never reaches the model. Wired into the
- *  github policy below as maxTokensCap. */
-export const GITHUB_MAX_OUTPUT_TOKENS = 400;
-
 // Keyed by Platform (not string) so a typo'd platform id fails tsc instead of
 // silently no-op'ing the policy; the string-typed accessors below cast at the
 // boundary since routes carry platform ids as plain strings.
 export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPolicy>> = {
+  jamai: { drop: ['top_k', 'min_p', 'seed', 'repetition_penalty', 'logprobs', 'top_logprobs', 'response_format'] },
+  // Inferbase Free managed inference rejects output budgets above 1,024.
+  // Match the documented upstream ceiling, not a new application quota.
+  inferbase: { defaultMaxTokens: 1024, maxTokensCap: 1024 },
+  // Gizmo rejects all unlisted fields; reflect its text-only API in discovery
+  // as well as the adapter. This is the upstream ceiling, not a new quota.
+  gizmo: { drop: [...EXTENDED_SAMPLING_KEYS], defaultMaxTokens: 1024, maxTokensCap: 32768 },
+  // Moondream maps reasoning effort to a boolean and max_tokens to
+  // max_completion_tokens. 4096 is the documented upstream output ceiling.
+  moondream: {
+    drop: ['top_k', 'min_p', 'seed', 'presence_penalty', 'frequency_penalty', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'response_format'],
+    maxTokensCap: 4096,
+  },
+  // ACLIDE uses Responses; these Chat Completions parameters have no mapping.
+  aclide: {
+    drop: ['top_k', 'min_p', 'seed', 'presence_penalty', 'frequency_penalty', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'],
+  },
   // Sail's stable Responses API accepts temperature/top_p, JSON Schema output,
   // tools and reasoning effort. The remaining Chat Completions knobs are not
   // supported and are intentionally omitted by the dedicated adapter.
@@ -257,18 +268,15 @@ export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPoli
     rename: { seed: 'random_seed' },
   },
   // Groq documents logprobs / top_logprobs / logit_bias as unsupported and
-  // rejects requests that include them.
-  groq: { drop: ['logprobs', 'top_logprobs', 'logit_bias'] },
-  // GitHub Models sits on Azure OpenAI, which 400s "Unrecognized request
-  // argument" for knobs outside the OpenAI set. Its reasoning_effort enum is
-  // the older low/medium/high one, so 'none'/'minimal' are clamped rather
-  // than sent. Its free tier also refuses any max_tokens above
-  // GITHUB_MAX_OUTPUT_TOKENS, so the cap is clamped here instead of being
-  // spent as a wasted fallback hop.
-  github: {
-    drop: ['top_k', 'min_p', 'repetition_penalty'],
+  // rejects requests that include them. Its reasoning_effort enum is the plain
+  // low/medium/high one: 'none' and 'minimal' are rejected with a 400
+  // ("must be one of low, medium, or high", observed on openai/gpt-oss-120b),
+  // which cost the request a fallback hop onto another platform's copy of the
+  // same model. Clamped rather than dropped so the knob still arrives, at the
+  // weakest setting Groq accepts.
+  groq: {
+    drop: ['logprobs', 'top_logprobs', 'logit_bias'],
     reasoningEfforts: ['low', 'medium', 'high'],
-    maxTokensCap: GITHUB_MAX_OUTPUT_TOKENS,
   },
   // Gemini's generationConfig has no equivalents for these; the adapter
   // translates the rest natively (topK, seed, penalties, responseSchema, and
@@ -376,13 +384,13 @@ export function maxTokensCapFor(platform: string): number | undefined {
  * openai-compat (and its subclasses), cloudflare, cohere, google and aihorde
  * all do.
  */
-export function resolveMaxTokens(platform: string, requested: number | undefined): number | undefined {
+export function resolveMaxTokens(platform: string, requested: number | undefined, contextBudget?: number): number | undefined {
   const resolved = requested ?? defaultMaxTokensFor(platform);
   if (resolved == null) return resolved;
   // The tighter ceiling wins: a platform's hard reject applies even with the
   // operator cap off, and an operator cap below it applies everywhere.
-  const caps = [unifiedMaxTokensCap(), maxTokensCapFor(platform)].filter((c): c is number => c != null);
-  return caps.length === 0 ? resolved : Math.min(resolved, ...caps);
+  const caps = [unifiedMaxTokensCap(), maxTokensCapFor(platform), contextBudget].filter((c): c is number => c != null && c > 0);
+  return caps.length === 0 ? resolved : Math.max(1, Math.min(resolved, ...caps));
 }
 
 // ── Unified output-token cap ─────────────────────────────────────────────────
@@ -430,13 +438,18 @@ export function platformDropsResponseFormat(platform: string): boolean {
  *  every surface supports, plus tools when the model does, minus the
  *  platform's droplist. */
 export function supportedParametersFor(platform: string, caps: { tools?: boolean } = {}): string[] {
+  // Unlike the generic base set, Moondream has neither stop nor tools.
+  if (platform === 'moondream') return ['temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'stream', 'reasoning_effort'];
   const policy = PLATFORM_PARAM_POLICIES[platform as Platform];
   const dropped = new Set<string>(policy?.drop ?? []);
   const params = [
     'temperature', 'top_p', 'max_tokens', 'max_completion_tokens', 'stop', 'stream',
     ...EXTENDED_SAMPLING_KEYS.filter(k => !dropped.has(k)),
   ];
-  if (caps.tools) params.push('tools', 'tool_choice', 'parallel_tool_calls');
+  if (caps.tools) {
+    params.push('tools', 'tool_choice');
+    if (platform !== 'jamai') params.push('parallel_tool_calls');
+  }
   return params;
 }
 

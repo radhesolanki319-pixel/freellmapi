@@ -19,8 +19,9 @@ import { cn } from '@/lib/utils'
 //      the tile it has to sit on, that value is moved in OKLCH lightness only:
 //      hue is held exactly, chroma is held and clamped to the sRGB gamut, and
 //      lightness stops at the first step that clears 3:1. The mark still reads
-//      as that brand's colour. Only claude, aider and kilo need this, and only
-//      on one tile each; the untouched brand hex is kept on the other tile.
+//      as that brand's colour. Only claude, aider, kilo and reasonix need this,
+//      and only on one tile each; the untouched brand hex is kept on the other
+//      tile.
 //   3. `generic` is not a brand — it stays `currentColor`.
 //
 // Contrast is measured against the tile itself, `bg-muted`, which resolves to
@@ -51,6 +52,16 @@ import { cn } from '@/lib/utils'
 //   atomcode  AtomCode     lettermark only: no vector published; hue sampled from the        AtomGit TM, nominative use
 //                          app icon cdn-news.gitcode.com/news/atomcode-icon1.png (the
 //                          gradient's dominant blue, at two of its four corners)
+//   openclaw  OpenClaw     openclaw.ai/favicon.svg (the lobster mark: body, claws and         MIT (openclaw/openclaw)
+//                          antennae); the eyes are dropped with the gradient, as every
+//                          mark here is painted flat in one brand colour
+//   hermes    Hermes Agent lettermark only: the published mark (NousResearch/hermes-agent   Nous Research TM, nominative use
+//                          website/static/img/logo.png) is a raster portrait and the SVG
+//                          favicon is a text glyph, so neither fits the 24px grid
+//   pi        Pi           pi.dev/favicon.svg (the monochrome mark; the press kit's       Earendil TM, nominative use
+//                          three-colour logo is the same geometry)
+//   reasonix  Reasonix     esengine/DeepSeek-Reasonix `docs/logo.svg` (the ◈ brand mark:     MIT
+//                          three concentric diamonds, without the wordmark)
 //
 //   id        light tile        ratio  dark tile         ratio  dark-mode treatment
 //   claude    #D37152            3.08  #D97757            5.52  brand #D97757 on dark; light tile is
@@ -81,6 +92,18 @@ import { cn } from '@/lib/utils'
 //   mimo      #000000           19.26  #FFFFFF           17.22  published pair (the favicon is black artwork on
 //                                                               transparent, so it inverts on the dark tile)
 //   atomcode  #3C82F6            3.37  #3C82F6            4.69  icon blue unchanged; clears on both tiles
+//   openclaw  #991B1B            7.62  #FF4D4D            5.27  published pair: the mark is a gradient from
+//                                                               #FF4D4D to #991B1B, and each tile takes the
+//                                                               stop that clears on it (the light stop is
+//                                                               3.00 on the light tile, right at the line)
+//   hermes    #000000           19.26  #FFFFFF           17.22  published pair (the logo is flat black artwork
+//                                                               on white, so it inverts on the dark tile)
+//   pi        #111111           17.32  #F6F6F6           15.94  published pair (the favicon's own light and
+//                                                               dark-scheme fills)
+//   reasonix  #6191C6            3.02  #93C5FD            9.55  the mark's gradient midpoint #93C5FD on dark;
+//                                                               light tile is the same hue tuned down (rule 2,
+//                                                               1.65→3.02): oklch(0.809 0.096 251.8) →
+//                                                               oklch(0.645 0.096 251.8)
 //   generic   currentColor         —   currentColor         —   not a brand mark
 //
 // Cursor also publishes a 2.5D cube in five warm greys (#43413c #55544f #72716d
@@ -234,6 +257,69 @@ const brands: Record<string, Brand> = {
   // that PNG, which clears 3:1 on both tiles as published.
   atomcode: {
     tint: '[--mk:#3C82F6] dark:[--mk:#3C82F6]',
+  },
+  // openclaw.ai/favicon.svg, drawn on a 120-unit box: the body and the two
+  // claws are filled paths, the antennae stroked. Scaled 0.2 and centred onto
+  // the 24 grid. The published mark paints the shell in a red gradient with
+  // dark eyes; here the shell is one flat brand red, like every other mark.
+  openclaw: {
+    tint: '[--mk:#991B1B] dark:[--mk:#FF4D4D]',
+    art: (
+      <g transform="translate(0 0) scale(0.2)">
+        <path d="M60 10 C30 10 15 35 15 55 C15 75 30 95 45 100 L45 110 L55 110 L55 100 C55 100 60 102 65 100 L65 110 L75 110 L75 100 C90 95 105 75 105 55 C105 35 90 10 60 10Z" />
+        <path d="M20 45 C5 40 0 50 5 60 C10 70 20 65 25 55 C28 48 25 45 20 45Z" />
+        <path d="M100 45 C115 40 120 50 115 60 C110 70 100 65 95 55 C92 48 95 45 100 45Z" />
+        <path d="M45 15 Q35 5 30 8" fill="none" stroke="var(--mk, currentColor)" strokeWidth={3} strokeLinecap="round" />
+        <path d="M75 15 Q85 5 90 8" fill="none" stroke="var(--mk, currentColor)" strokeWidth={3} strokeLinecap="round" />
+      </g>
+    ),
+  },
+  // Nous Research publishes the Hermes Agent mark only as a raster portrait,
+  // so the lettermark stands in. The artwork is flat black on white, which is
+  // the published pair treatment: black on the light tile, white on the dark.
+  hermes: {
+    tint: '[--mk:#000000] dark:[--mk:#FFFFFF]',
+  },
+  // pi.dev/favicon.svg, drawn on a 560-unit box with three solid blocks.
+  // Scaled 0.0375 and centred, so it spans 21 units: a mark that fills its
+  // whole square reads heavier than the set's outlined marks at full size.
+  pi: {
+    tint: '[--mk:#111111] dark:[--mk:#F6F6F6]',
+    art: (
+      <g transform="translate(1.5 1.5) scale(0.0375)">
+        <path d="M420 280H280V140H0V0H420V280Z" />
+        <path d="M560 560H420V280H560V560Z" />
+        <path d="M140 560H0V140H140V280H280V420H140V560Z" />
+      </g>
+    ),
+  },
+  // esengine/DeepSeek-Reasonix docs/logo.svg: the ◈ mark is three concentric
+  // diamonds on a 92-unit box — two stroked, the inner one filled. Scaled
+  // 0.21 about the centre, so it spans 19.3 units. The published artwork
+  // pulses the strokes between 3.5 and 5.5; the peak width is used so the
+  // outlines survive at 20px. The cyan-to-violet gradient becomes one flat
+  // colour, its midpoint stop.
+  reasonix: {
+    tint: '[--mk:#6191C6] dark:[--mk:#93C5FD]',
+    art: (
+      <g transform="translate(12 12) scale(0.21)" stroke="var(--mk, currentColor)" strokeLinejoin="round">
+        <path d="M0-46 46 0 0 46-46 0Z" fill="none" strokeWidth={5.5} />
+        <path d="M0-26 26 0 0 26-26 0Z" fill="none" strokeWidth={3.5} />
+        <path d="M0-11 11 0 0 11-11 0Z" strokeWidth={0} />
+      </g>
+    ),
+  },
+  // ZCode (Z.ai): its app icon is a white Z on a near-black rounded square,
+  // drawn here as the square with the Z knocked out so it reads on both tiles.
+  zcode: {
+    tint: '[--mk:#2B2B2B] dark:[--mk:#E5E5E5]',
+    art: (
+      <path
+        fill="var(--mk, currentColor)"
+        fillRule="evenodd"
+        d="M7 3h10a4 4 0 0 1 4 4v10a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4ZM7 7v2.4h6.6L7 14.6V17h10v-2.4h-6.6L17 9.4V7Z"
+      />
+    ),
   },
   // Any other OpenAI-compatible client: our own terminal glyph, not a brand
   // mark, so it keeps the page foreground colour on both tiles.

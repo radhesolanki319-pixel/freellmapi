@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { GoogleProvider } from '../../providers/google.js';
+import { isStreamTruncatedError } from '../../lib/error-classify.js';
 
 describe('GoogleProvider', () => {
   let provider: GoogleProvider;
@@ -68,6 +69,76 @@ describe('GoogleProvider', () => {
     expect(parts).toContainEqual({ inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' } });
   });
 
+  // #1881: caller-supplied image URLs get the custom-provider address policy,
+  // on the first URL and on every redirect hop.
+  describe('image URL fetches (#1881)', () => {
+    const geminiOk = () => new Response(JSON.stringify({
+      candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+    const png = () => new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'image/png' } });
+    const redirect = (to: string) => new Response(null, { status: 302, headers: { location: to } });
+
+    async function send(url: string, fetchImpl: (u: string) => Response) {
+      const seen: string[] = [];
+      const spy = vi.spyOn(global, 'fetch').mockImplementation(async (input: any) => {
+        const u = String(input);
+        if (u.includes('generativelanguage.googleapis.com')) return geminiOk();
+        seen.push(u);
+        return fetchImpl(u);
+      });
+      await provider.chatCompletion('test-key', [
+        { role: 'user', content: [
+          { type: 'text', text: 'what is this?' },
+          { type: 'image_url', image_url: { url } },
+        ] as any },
+      ], 'gemini-2.5-flash');
+      const geminiCall = spy.mock.calls.find(c => String(c[0]).includes('generativelanguage.googleapis.com'))!;
+      const parts = JSON.parse((geminiCall[1] as any).body).contents[0].parts;
+      return { seen, parts };
+    }
+
+    it('never requests a metadata address and skips the image', async () => {
+      const { seen, parts } = await send('http://169.254.169.254/latest/meta-data/', png);
+      expect(seen).toEqual([]);
+      expect(parts.some((p: any) => p.inlineData)).toBe(false);
+    });
+
+    it('does not follow a redirect from a public host to a metadata address', async () => {
+      const { seen, parts } = await send('http://203.0.113.5/cat.png', (u) =>
+        u.startsWith('http://203.0.113.5') ? redirect('http://169.254.169.254/latest/meta-data/') : png());
+      expect(seen).toEqual(['http://203.0.113.5/cat.png']);
+      expect(parts.some((p: any) => p.inlineData)).toBe(false);
+    });
+
+    it('asks fetch not to follow redirects itself', async () => {
+      const spy = vi.spyOn(global, 'fetch');
+      await send('http://203.0.113.5/cat.png', png);
+      const imageCall = spy.mock.calls.find(c => String(c[0]) === 'http://203.0.113.5/cat.png')!;
+      expect((imageCall[1] as any).redirect).toBe('manual');
+    });
+
+    it('follows a redirect to another public host and inlines the image', async () => {
+      const { seen, parts } = await send('http://203.0.113.5/cat.png', (u) =>
+        u.startsWith('http://203.0.113.5') ? redirect('http://198.51.100.7/cdn/cat.png') : png());
+      expect(seen).toEqual(['http://203.0.113.5/cat.png', 'http://198.51.100.7/cdn/cat.png']);
+      expect(parts).toContainEqual({ inlineData: { mimeType: 'image/png', data: Buffer.from([1, 2, 3]).toString('base64') } });
+    });
+
+    it('gives up after too many redirects', async () => {
+      let n = 0;
+      const { seen, parts } = await send('http://203.0.113.5/a', () => redirect(`http://203.0.113.5/r${++n}`));
+      expect(seen.length).toBe(4);
+      expect(parts.some((p: any) => p.inlineData)).toBe(false);
+    });
+
+    it('skips an image whose declared size is over the cap without reading it', async () => {
+      const { parts } = await send('http://203.0.113.5/huge.png', () =>
+        new Response(new Uint8Array([1]), { status: 200, headers: { 'content-type': 'image/png', 'content-length': String(9 * 1024 * 1024) } }));
+      expect(parts.some((p: any) => p.inlineData)).toBe(false);
+    });
+  });
+
   it('should throw on API error', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({
       ok: false,
@@ -87,6 +158,36 @@ describe('GoogleProvider', () => {
 
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: false, status: 401 } as any);
     expect(await provider.validateKey('invalid-key')).toMatchObject({ valid: false });
+  });
+
+  it.each([false, true])('preserves daily quota evidence with streaming=%s (#1339)', async (stream) => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({ error: {
+      message: 'You exceeded your current quota.',
+      details: [
+        { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [
+          { quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' },
+          { quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' },
+        ] },
+        { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '17s' },
+      ],
+    } }), { status: 429 }));
+    const messages = [{ role: 'user' as const, content: 'Hi' }];
+    const request = stream
+      ? provider.streamChatCompletion('test-key', messages, 'gemini-2.5-pro').next()
+      : provider.chatCompletion('test-key', messages, 'gemini-2.5-pro');
+    await expect(request).rejects.toMatchObject({ status: 429, dailyQuotaExhausted: true, retryAfterMs: 17_000 });
+  });
+
+  it.each([
+    [{ '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier' }] }],
+    [{ '@type': 'type.googleapis.com/google.rpc.Help', quotaId: 'PerDay' }],
+    [{ '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: null }],
+  ])('does not invent daily exhaustion from other details (%j)', async (...details) => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({ error: {
+      message: 'Quota exceeded', details,
+    } }), { status: 429 }));
+    await expect(provider.chatCompletion('test-key', [], 'gemini-2.5-pro'))
+      .rejects.toMatchObject({ dailyQuotaExhausted: false });
   });
 
   // #268: Google reports a bad key as HTTP 400 INVALID_ARGUMENT / API_KEY_INVALID,
@@ -240,6 +341,32 @@ describe('GoogleProvider', () => {
     expect(toolDeltas).toHaveLength(1);
     expect(toolDeltas[0].function.name).toBe('get_weather');
     expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('tool_calls');
+  });
+
+  it('gives every streamed tool call its own index and id, including parallel calls in one chunk', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => {
+      const frames = [
+        { candidates: [{ content: { parts: [
+          { functionCall: { name: 'get_weather', args: { city: 'Dublin' } } },
+          { functionCall: { name: 'get_weather', args: { city: 'Paris' } } },
+        ] } }] },
+        { candidates: [{ content: { parts: [{ functionCall: { name: 'get_time', args: { tz: 'UTC' } } }] } }] },
+        { candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] },
+      ];
+      // One body, so every frame is parsed within the same millisecond.
+      return new Response(frames.map(f => `data: ${JSON.stringify(f)}\n\n`).join(''), { status: 200 });
+    });
+
+    const chunks: any[] = [];
+    for await (const c of provider.streamChatCompletion('test-key', [{ role: 'user', content: 'Weather and time?' }], 'gemini-3.5-flash')) chunks.push(c);
+
+    const calls = chunks.flatMap(c => c.choices[0].delta.tool_calls ?? []);
+    expect(calls.map(c => [c.index, c.function.name, c.function.arguments])).toEqual([
+      [0, 'get_weather', '{"city":"Dublin"}'],
+      [1, 'get_weather', '{"city":"Paris"}'],
+      [2, 'get_time', '{"tz":"UTC"}'],
+    ]);
+    expect(new Set(calls.map(c => c.id)).size).toBe(3);
   });
 
   it('keeps functionCall/functionResponse history for Gemma multi-turn tool round-trips (#582)', async () => {
@@ -660,6 +787,40 @@ describe('GoogleProvider', () => {
     const text = chunks.map(c => c.choices[0].delta.content ?? '').join('');
     expect(text).toBe('Hello');
     expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('stop');
+  });
+
+  // An abrupt EOF — no `[DONE]`, no `finishReason` — is a truncated generation,
+  // not a completion (providers/base.ts:392-397). This adapter used to
+  // synthesize `finish_reason: 'stop'` for it, so the client was told a
+  // half-written answer was complete, the request was logged 'success', and the
+  // route was never benched. Throwing the shared message hands it to
+  // isStreamTruncatedError and the fallback loop's truncation-streak bench.
+  it('throws on an abrupt EOF instead of synthesizing a stop chunk', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(sseResponse([
+      'data: {"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}\n\n',
+      'data: {"candidates":[{"content":{"parts":[{"text":"lo, this answer is cut"}]}}]}\n\n',
+      // body ends here: no [DONE], no finishReason
+    ]));
+
+    const chunks: any[] = [];
+    let thrown: any;
+    try {
+      for await (const c of provider.streamChatCompletion(
+        'test-key',
+        [{ role: 'user', content: 'Hi' }],
+        'gemini-2.5-pro',
+      )) chunks.push(c);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    // The classifier the fallback loop consults must recognize it.
+    expect(isStreamTruncatedError(thrown)).toBe(true);
+    // The content already streamed is still delivered; what must NOT appear is
+    // a terminal chunk claiming the truncated answer finished normally.
+    expect(chunks.map(c => c.choices[0].delta.content ?? '').join('')).toBe('Hello, this answer is cut');
+    expect(chunks.some(c => c.choices[0].finish_reason)).toBe(false);
   });
 
   it('streams Gemini thought parts as reasoning_content, not visible content (#539)', async () => {

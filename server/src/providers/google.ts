@@ -10,6 +10,7 @@ import type {
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
 import { contentToString } from '../lib/content.js';
 import { proxyFetch } from '../lib/proxy.js';
+import { assessProviderUrl } from '../lib/url-guard.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs, streamStallTimeoutMs } from '../lib/provider-timeout.js';
 import { sanitizeForGemini } from '../lib/gemini-wire.js';
@@ -18,6 +19,22 @@ import { resolveMaxTokens } from '../lib/sampling-params.js';
 export { sanitizeForGemini } from '../lib/gemini-wire.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+
+function googleHttpError(res: Response, body: any) {
+  const err = providerHttpError(res, `Google API error ${res.status}: ${body?.error?.message ?? res.statusText}`, body);
+  // Gemini's human-readable message can omit the quota window. Keep only the
+  // daily signal from QuotaFailure, not the complete upstream payload (#1339).
+  const details = body?.error?.details;
+  if (res.status === 429 && Array.isArray(details)) {
+    err.dailyQuotaExhausted = details.some(detail =>
+      detail?.['@type'] === 'type.googleapis.com/google.rpc.QuotaFailure'
+      && Array.isArray(detail.violations)
+      && detail.violations.some((violation: any) =>
+        typeof violation?.quotaId === 'string' && /PerDay/.test(violation.quotaId)),
+    );
+  }
+  return err;
+}
 
 // Gemini 3 REQUIRES the `thoughtSignature` that accompanied a function call to
 // be echoed back whenever that call appears in conversation history, or it
@@ -326,11 +343,40 @@ function extractImageUrl(block: unknown): string | undefined {
   return undefined;
 }
 
+const MAX_IMAGE_REDIRECTS = 3;
+const IMAGE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+// Fetch a caller-supplied image URL with the same address policy custom
+// providers get (#1881): every hop, the first URL and each redirect target, is
+// classified before it is requested, so an image URL (or a public host that
+// redirects) cannot reach cloud metadata or link-local addresses, or private
+// ones when FREEAPI_BLOCK_PRIVATE_PROVIDER_URLS is set. Redirects are followed
+// by hand for that reason, a few hops at most, since image hosts and CDNs often
+// redirect. Returns null when blocked or failed.
+async function fetchImageChecked(rawUrl: string): Promise<Response | null> {
+  let url = rawUrl;
+  const signal = AbortSignal.timeout(30_000);
+  for (let hop = 0; hop <= MAX_IMAGE_REDIRECTS; hop++) {
+    if (!(await assessProviderUrl(url)).allowed) return null;
+    // 30s cap so a stalled image host cannot hang the whole request;
+    // classified as `image` for triage.
+    const res = await proxyFetch(url, { signal, redirect: 'manual' }, 'google', 'image', 30_000);
+    if (!IMAGE_REDIRECT_STATUSES.has(res.status)) return res;
+    const location = res.headers.get('location');
+    if (!location) return null;
+    try {
+      url = new URL(location, url).href;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 // Convert an image URL to a Gemini inlineData part. Handles base64 `data:` URLs
 // directly; for `http(s)` URLs we fetch and inline because the Gemini API does
-// not fetch external URLs itself. Fetching a user-supplied URL is a minor SSRF
-// surface, acceptable for a single-user self-hosted proxy; we still restrict to
-// http/https and cap the size. Returns null (part skipped) on any failure.
+// not fetch external URLs itself. The fetch goes through fetchImageChecked
+// above, and the size is capped. Returns null (part skipped) on any failure.
 async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; data: string } | null> {
   const dataMatch = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(url);
   if (dataMatch) {
@@ -344,12 +390,10 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
   }
   if (/^https?:\/\//i.test(url)) {
     try {
-      // Internal helper that turns an image URL into inline data for the
-      // Gemini request body. No formal timeout — relies on the platform's
-      // own default. Use a 30s cap to avoid hanging the whole request when
-      // an image host stalls; classify as `image` for triage.
-      const res = await proxyFetch(url, { signal: AbortSignal.timeout(30_000) }, 'google', 'image', 30_000);
-      if (!res.ok) return null;
+      const res = await fetchImageChecked(url);
+      if (!res || !res.ok) return null;
+      const declared = Number(res.headers.get('content-length'));
+      if (Number.isFinite(declared) && declared > MAX_IMAGE_BYTES) return null;
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) return null;
       const mimeType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/jpeg';
@@ -476,11 +520,11 @@ async function toGeminiContents(messages: ChatMessage[]): Promise<{
   };
 }
 
-function extractToolCalls(parts: GeminiPart[] | undefined): ChatToolCall[] {
+function extractToolCalls(parts: GeminiPart[] | undefined, firstIndex = 0): ChatToolCall[] {
   const calls: ChatToolCall[] = [];
   if (!parts) return calls;
 
-  let fallbackIndex = 0;
+  let fallbackIndex = firstIndex;
   for (const part of parts) {
     if (!part.functionCall?.name) continue;
 
@@ -560,7 +604,7 @@ export class GoogleProvider extends BaseProvider {
       contents: request.contents,
       generationConfig: {
         temperature: options?.temperature,
-        maxOutputTokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        maxOutputTokens: resolveMaxTokens(this.platform, options?.max_tokens, options?.contextBudget),
         topP: options?.top_p,
         stopSequences: toGeminiStopSequences(options?.stop),
         ...toGeminiExtendedConfig(options),
@@ -592,7 +636,7 @@ export class GoogleProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, err);
+      throw googleHttpError(res, err);
     }
 
     const data = await res.json() as GeminiResponse;
@@ -643,7 +687,7 @@ export class GoogleProvider extends BaseProvider {
       contents: request.contents,
       generationConfig: {
         temperature: options?.temperature,
-        maxOutputTokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        maxOutputTokens: resolveMaxTokens(this.platform, options?.max_tokens, options?.contextBudget),
         topP: options?.top_p,
         stopSequences: toGeminiStopSequences(options?.stop),
         ...toGeminiExtendedConfig(options),
@@ -673,7 +717,7 @@ export class GoogleProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, err);
+      throw googleHttpError(res, err);
     }
 
     const reader = res.body?.getReader();
@@ -686,6 +730,10 @@ export class GoogleProvider extends BaseProvider {
     let sawToolCalls = false;
 
     const seenToolCallKeys = new Set<string>();
+    // Stream position of the next tool call. Routes assemble streamed calls by
+    // `index`, so every call needs its own, including parallel calls that
+    // arrive in one chunk.
+    let nextToolIndex = 0;
 
     // Same mid-stream inactivity watchdog as readSseStream (#553): this adapter
     // parses Gemini's own frame format, so it reads the body itself and used to
@@ -745,12 +793,12 @@ export class GoogleProvider extends BaseProvider {
 
           const text = extractText(parts);
           const reasoningContent = extractReasoningContent(parts);
-          const toolCalls = extractToolCalls(parts).filter(call => {
+          const toolCalls = extractToolCalls(parts, nextToolIndex).filter(call => {
             const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
             if (seenToolCallKeys.has(key)) return false;
             seenToolCallKeys.add(key);
             return true;
-          });
+          }).map(call => ({ ...call, index: nextToolIndex++ }));
 
           if ((text && text.length > 0) || (reasoningContent && reasoningContent.length > 0) || toolCalls.length > 0) {
             sawToolCalls = sawToolCalls || toolCalls.length > 0;
@@ -798,18 +846,24 @@ export class GoogleProvider extends BaseProvider {
       reader.cancel().catch(() => { /* upstream already gone */ });
     }
 
+    // Reaching here means the body ended with neither `[DONE]` nor any
+    // `finishReason` — both legitimate terminators `return` from inside the
+    // loop above, so the only way out to this point is the `if (done) break`
+    // on an abrupt EOF (an h2 END_STREAM from an edge, or the backend cutting
+    // the generation mid-answer).
+    //
+    // This used to synthesize `finish_reason: 'stop'`, which told the client a
+    // half-written answer had completed normally: no failover, the request row
+    // logged 'success', and the route never benched. base.ts:392-397 states the
+    // opposite contract for every adapter that goes through readSseStream —
+    // "a stream that ends without [DONE] AND without any finish_reason is a
+    // truncated generation, not a completion" — and throws (base.ts:471). This
+    // adapter parses Gemini's own frame format and reads the body itself, so it
+    // never inherited that. Throw the same message: isStreamTruncatedError
+    // (lib/error-classify.ts:685) matches on it, and the fallback loop already
+    // fails over and bench-counts the streak (lib/fallback-loop.ts:485).
     if (!emittedFinish) {
-      yield {
-        id,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: modelId,
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: sawToolCalls ? 'tool_calls' : 'stop',
-        }],
-      };
+      throw new Error(`${this.name} stream ended unexpectedly (no [DONE], no finish_reason) — connection reset or truncated upstream`);
     }
   }
 

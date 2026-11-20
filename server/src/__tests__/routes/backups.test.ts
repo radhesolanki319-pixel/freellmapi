@@ -6,7 +6,7 @@ import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb } from '../../db/index.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
-import { createBackup } from '../../services/backups.js';
+import { createBackup, restoreBackup } from '../../services/backups.js';
 
 let dashToken = '';
 let dataDir = '';
@@ -90,6 +90,23 @@ describe('Backups API', () => {
     expect(after.body.items.some((item: { id: number }) => item.id === created.body.backup.id)).toBe(false);
   });
 
+  it('restores request history without charging the monthly ledger twice', () => {
+    const db = getDb();
+    const keyId = 851_901;
+    const insert = () => db.prepare(`INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms)
+      VALUES ('groq', 'backup-ledger-test', ?, 'success', 10, 5, 1)`).run(keyId);
+    const usage = () => db.prepare('SELECT requests, tokens FROM key_monthly_usage WHERE key_id = ?').get(keyId);
+    insert();
+    const full = createBackup(db);
+    restoreBackup(db, full.id);
+    expect(usage()).toEqual({ requests: 1, tokens: 15 });
+    const partial = createBackup(db, { tables: ['requests'] });
+    restoreBackup(db, partial.id);
+    expect(usage()).toEqual({ requests: 1, tokens: 15 });
+    insert();
+    expect(usage()).toEqual({ requests: 2, tokens: 30 });
+  });
+
   it('round-trips the schedule setting', async () => {
     const put = await request(app, 'PUT', '/api/backups/schedule', {
       enabled: true,
@@ -118,6 +135,14 @@ describe('Backups API', () => {
 
     const scheduled = createBackup(getDb(), { tables: [], source: 'scheduled', backupPath: '' });
     expect(scheduled.filename).toMatch(/^auto-backup-.*\.sql$/);
+  });
+
+  it('names and lists the desktop updater\'s backup as pre-update', async () => {
+    const backup = createBackup(getDb(), { tables: [], source: 'pre-update', backupPath: '' });
+    expect(backup.filename).toMatch(/^pre-update-.*\.sql$/);
+    const listed = await request(app, 'GET', '/api/backups');
+    const items = listed.body.items as Array<{ id: number; source: string }>;
+    expect(items.find(item => item.id === backup.id)?.source).toBe('pre-update');
   });
 
   it('never dumps the accounts, sessions or URL-token tables', async () => {

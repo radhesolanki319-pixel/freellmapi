@@ -181,14 +181,14 @@ describe('sanitizeForGemini', () => {
   });
 
   it('strips composition / structural keywords absent from Google Schema proto', () => {
-    // not / allOf / oneOf / prefixItems / contains / propertyNames / multipleOf /
-    // dependencies / deprecated are all absent from Google's Schema proto
-    // (https://ai.google.dev/api/caching#Schema). Only anyOf is supported.
+    // not / prefixItems / contains / propertyNames / multipleOf / dependencies /
+    // deprecated are all absent from Google's Schema proto
+    // (https://ai.google.dev/api/caching#Schema). Only anyOf is supported;
+    // oneOf and allOf are rewritten rather than stripped (#1874, see
+    // gemini-schema-compat.test.ts).
     const input = {
       type: 'object',
       not: { type: 'null' },
-      allOf: [{ type: 'object' }],
-      oneOf: [{ type: 'string' }, { type: 'number' }],
       dependencies: { a: ['b'] },
       deprecated: true,
       properties: {
@@ -198,11 +198,13 @@ describe('sanitizeForGemini', () => {
         count: { type: 'number', multipleOf: 0.5 },
       },
     };
+    // prefixItems/contains are stripped, but Gemini requires `items` on every
+    // array (#1334), so the tuple's member becomes `items` and `bag` gets `{}`.
     expect(sanitizeForGemini(input)).toEqual({
       type: 'object',
       properties: {
-        tuple: { type: 'array' },
-        bag: { type: 'array' },
+        tuple: { type: 'array', items: { type: 'string' } },
+        bag: { type: 'array', items: {} },
         names: { type: 'object' },
         count: { type: 'number' },
       },

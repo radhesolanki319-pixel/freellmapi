@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { getAllPenalties, getRoutingScores, getRoutingStrategy, setRoutingStrategy, setCustomWeights, getExploreEnabled, setExploreEnabled, getPeakHoursConfig, setPeakHoursConfig, getActiveRoutingWeights, getKeySelectionStrategy, setKeySelectionStrategy } from '../services/router.js';
 import { BANDIT_PRESETS, isValidTimezone, type RoutingStrategy } from '../services/scoring.js';
-import { parseBudget } from '../lib/budget.js';
+import { parseBudget, monthlyBudgetScore } from '../lib/budget.js';
 import { getModelGroups } from '../services/model-groups.js';
 import { getPenaltyInspector, clearRouterPressure } from '../services/penalty-inspector.js';
 import { getCooldownCeilingMs, setCooldownCeilingMs, MIN_COOLDOWN_CEILING_MS, MAX_COOLDOWN_CEILING_MS } from '../services/ratelimit.js';
@@ -17,8 +17,16 @@ import { getActiveProfileId } from '../services/profile-models.js';
 import { qualifiedModelMemberId } from '../lib/endpoint-scope.js';
 import { overriddenFieldNames } from '../services/model-state.js';
 import { parseModelScope, scopeAllows } from '../lib/model-scope.js';
+import { getQuotaOutlook } from '../services/quota-outlook.js';
+import { getDecisionRoutingStatus, setDecisionRoutingSettings } from '../services/routing-decision.js';
 
 export const fallbackRouter = Router();
+
+// Dashboard-session authenticated by app.ts. Polling only reads saved quota
+// observations and request history, never provider endpoints or key material.
+fallbackRouter.get('/quota-forecast', (_req: Request, res: Response) => {
+  res.json(getQuotaOutlook());
+});
 
 // ── Bandit routing strategy ─────────────────────────────────────────────────
 // GET  /routing → active strategy, preset weights, and the per-model score
@@ -32,6 +40,9 @@ fallbackRouter.get('/routing', (_req: Request, res: Response) => {
     peakEndHour: peakHours.endHour,
     peakTimezone: peakHours.timezone,
     cooldownCeilingMs: getCooldownCeilingMs(),
+    // Decision routing (#1354): its settings, whether a decision model is
+    // usable, and since-boot picks. Present whatever the active strategy is.
+    decision: getDecisionRoutingStatus(),
   });
 });
 
@@ -47,7 +58,7 @@ fallbackRouter.delete('/penalty-inspector', (_req: Request, res: Response) => {
 });
 
 const routingSchema = z.object({
-  strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom']),
+  strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom', 'decision']),
   // Only meaningful with strategy 'custom': the user's weight vector. Any
   // non-negative vector is accepted; setCustomWeights renormalizes to sum 1.
   weights: z.object({
@@ -74,6 +85,11 @@ const routingSchema = z.object({
     .min(MIN_COOLDOWN_CEILING_MS, { message: `cooldownCeilingMs must be at least ${MIN_COOLDOWN_CEILING_MS} (1 minute)` })
     .max(MAX_COOLDOWN_CEILING_MS, { message: `cooldownCeilingMs must be at most ${MAX_COOLDOWN_CEILING_MS} (24 hours)` })
     .nullable().optional(),
+  // Decision routing (#1354): which decision model picks the preset ('auto' or
+  // a decision model id) and the top probability below which it routes as
+  // Balanced. Saved whatever the strategy, so they can be set before switching.
+  decisionModel: z.string().trim().min(1).max(200).optional(),
+  decisionMinProbability: z.number().min(0).max(1).optional(),
 });
 
 // PUT /routing → switch strategy. Presets are just weight vectors over the three
@@ -82,7 +98,7 @@ const routingSchema = z.object({
 fallbackRouter.put('/routing', (req: Request, res: Response) => {
   const parsed = routingSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    res.status(400).json({ error: { message: parsed.error.issues.map(e => e.message).join(', ') } });
     return;
   }
   // Persist the weights before flipping the strategy so the new mode reads the
@@ -105,6 +121,7 @@ fallbackRouter.put('/routing', (req: Request, res: Response) => {
   if (parsed.data.cooldownCeilingMs !== undefined) {
     setCooldownCeilingMs(parsed.data.cooldownCeilingMs);
   }
+  setDecisionRoutingSettings({ model: parsed.data.decisionModel, minProbability: parsed.data.decisionMinProbability });
   try {
     setPeakHoursConfig({
       enabled: parsed.data.peakHoursAdjust,
@@ -126,6 +143,7 @@ fallbackRouter.put('/routing', (req: Request, res: Response) => {
     strategy: getRoutingStrategy(),
     exploreEnabled: getExploreEnabled(),
     keySelectionStrategy: getKeySelectionStrategy(),
+    decision: getDecisionRoutingStatus(),
     presets: BANDIT_PRESETS,
     weights: active.weights,
     peakAdjusted: active.adjusted,
@@ -145,7 +163,7 @@ const MODEL_COLUMNS = `
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
            m.tpm_limit, m.tpd_limit, m.context_window,
            m.monthly_token_budget, m.supports_vision, m.supports_tools,
-           m.key_id, m.endpoint_scope, ak.label AS key_label,
+           m.key_id, m.endpoint_scope, m.source AS model_source, ak.label AS key_label,
            mo.overrides_json IS NOT NULL AS has_overrides,
            mo.overrides_json,
            ts.source AS tombstone_source, ts.reason AS tombstone_reason`;
@@ -291,7 +309,11 @@ fallbackRouter.get('/', (req: Request, res: Response) => {
       monthlyTokenBudgetTokens: parseBudget(r.monthly_token_budget) * Math.max(1, keyCountMap.get(r.platform) ?? 1),
       supportsVision: r.supports_vision === 1,
       supportsTools: r.supports_tools === 1,
-      source: r.platform === 'custom' || r.key_id != null ? 'custom' : 'catalog',
+      // 'discovered' (#1348): fetched from a built-in provider's /models because
+      // the catalog carries none for it. Routes like a catalog row.
+      source: r.platform === 'custom' || r.key_id != null
+        ? 'custom'
+        : r.model_source === 'discovered' ? 'discovered' : 'catalog',
       keyId: r.key_id ?? null,
       keyLabel: r.key_label ?? null,
       // Which relay endpoint a custom row belongs to, and the id that names it
@@ -336,7 +358,7 @@ function knownModelIds(db: ReturnType<typeof getDb>): Set<number> {
 fallbackRouter.put('/', (req: Request, res: Response) => {
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    res.status(400).json({ error: { message: parsed.error.issues.map(e => e.message).join(', ') } });
     return;
   }
 
@@ -390,29 +412,6 @@ const SORT_PRESETS: Record<string, string> = {
   speed: 'm.speed_rank ASC',
 };
 
-function getBudgetScore(m: { monthly_token_budget: string; tpd_limit: number | null }): number {
-  if (m.tpd_limit != null) return m.tpd_limit * 30;
-  
-  const str = m.monthly_token_budget;
-  if (!str) return 0;
-  if (str.toLowerCase().includes('unlimited') || str.includes('∞')) return Infinity;
-  
-  const cleanStr = str.split('(')[0];
-  const matches = cleanStr.match(/[\d.]+/g);
-  let maxNum = 0;
-  if (matches) {
-    maxNum = Math.max(...matches.map(mStr => parseFloat(mStr)));
-  }
-  
-  let mult = 1;
-  const upper = cleanStr.toUpperCase();
-  if (upper.includes('B')) mult = 1_000_000_000;
-  else if (upper.includes('M')) mult = 1_000_000;
-  else if (upper.includes('K')) mult = 1_000;
-
-  return maxNum * mult;
-}
-
 fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
   const preset = String(req.params.preset);
   const db = getDb();
@@ -421,10 +420,13 @@ fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
 
   if (preset === 'budget') {
     const allModels = db.prepare(`SELECT id, monthly_token_budget, tpd_limit FROM models`).all() as any[];
-    allModels.sort((a, b) => getBudgetScore(b) - getBudgetScore(a));
+    allModels.sort((a, b) => monthlyBudgetScore(b) - monthlyBudgetScore(a));
     models = allModels.map(m => ({ id: m.id }));
   } else {
-    const orderBy = SORT_PRESETS[preset];
+    // `Object.hasOwn`, not a bare index: a plain read answers for inherited
+    // members too, so `POST /sort/constructor` used to slip past this guard
+    // (the function object is truthy) and crash `prepare()` with a 500.
+    const orderBy = Object.hasOwn(SORT_PRESETS, preset) ? SORT_PRESETS[preset] : undefined;
     if (!orderBy) {
       res.status(400).json({ error: { message: `Unknown preset: ${preset}. Use: intelligence, speed, budget` } });
       return;
@@ -480,39 +482,41 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
     ? db.prepare('SELECT id FROM profiles WHERE id = ?').get(activeProfileId) as any
     : null;
 
-  let rawModels: { model_db_id: number; platform: string; model_id: string; display_name: string; monthly_token_budget: string; priority: number; enabled: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null }[];
+  // Ordered by intelligence (rank 1 = smartest), not chain priority: the
+  // dashboard's monthly-budget bar and legend follow this order, and chain
+  // priority is seeded provider by provider, which read as "grouped by
+  // provider" (#1243). Priority stays as the tiebreaker within a rank.
+  let rawModels: { model_db_id: number; platform: string; model_id: string; display_name: string; monthly_token_budget: string; priority: number; enabled: number; intelligence_rank: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null }[];
 
   if (activeProfile) {
     // Profile mode: use profile_models chain (all models in profile, checked against enabled)
     rawModels = db.prepare(`
       SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.monthly_token_budget,
-             pm.priority, pm.enabled,
+             pm.priority, pm.enabled, m.intelligence_rank,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit
       FROM profile_models pm
       JOIN models m ON m.id = pm.model_db_id
       WHERE pm.profile_id = ? AND m.enabled = 1
-      ORDER BY pm.priority ASC
+      ORDER BY m.intelligence_rank ASC, pm.priority ASC
     `).all(activeProfileId) as any[];
   } else {
     // Default mode: use fallback_config (only include enabled models)
     rawModels = db.prepare(`
       SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name, m.monthly_token_budget,
-             fc.priority, fc.enabled,
+             fc.priority, fc.enabled, m.intelligence_rank,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit
       FROM fallback_config fc
       JOIN models m ON m.id = fc.model_db_id
       WHERE m.enabled = 1
-      ORDER BY fc.priority ASC
+      ORDER BY m.intelligence_rank ASC, fc.priority ASC
     `).all() as any[];
   }
 
   // Build per-model breakdown (only platforms with keys), preserving enabled state
   const usageRows = db.prepare(`
-    SELECT platform, model_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
-    FROM requests
-    WHERE created_at >= datetime('now', 'start of month')
-      AND request_type = 'chat'
-    GROUP BY platform, model_id
+    SELECT platform, model_id, tokens AS used
+    FROM model_monthly_usage
+    WHERE month = strftime('%Y-%m', 'now')
   `).all() as { platform: string; model_id: string; used: number }[];
   const usageByModel = new Map(usageRows.map(r => [`${r.platform}:${r.model_id}`, r.used]));
 
@@ -530,6 +534,7 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
         displayName: m.display_name,
         platform: m.platform,
         modelId: m.model_id,
+        intelligenceRank: m.intelligence_rank,
         budget: parseBudget(m.monthly_token_budget) * keys,
         used: usageByModel.get(`${m.platform}:${m.model_id}`) ?? 0,
         enabled: m.enabled === 1,

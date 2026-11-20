@@ -122,6 +122,24 @@ function readEnv(name: string): string {
  * user deliberately typed into the UI must not be silently overridden by them.
  */
 function resolveProxySource(dbValue: string): { url: string; source: string } {
+  const { url, source } = pickProxySource(dbValue);
+  return { url: normalizeProxyUrl(url), source };
+}
+
+/**
+ * Give a scheme-less `host:port` proxy an `http://` scheme. Windows Internet
+ * Options and macOS `scutil --proxy` both store the proxy that way, and so do
+ * plenty of hand-written HTTPS_PROXY values; `new URL('127.0.0.1:7890')`
+ * throws, so without this the proxy was logged as invalid and every request
+ * silently went direct (#1373).
+ */
+export function normalizeProxyUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed || /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return trimmed;
+  return `http://${trimmed}`;
+}
+
+function pickProxySource(dbValue: string): { url: string; source: string } {
   const explicit = readEnv('PROXY_URL');
   if (explicit) return { url: explicit, source: 'PROXY_URL' };
 
@@ -201,9 +219,20 @@ export function parseRegProxy(enableOut: string, serverOut: string): { url: stri
   const m = serverOut.match(/ProxyServer\s+REG_SZ\s+(.+)$/m);
   if (!m) return { url: '', source: 'none' };
   const raw = m[1].trim();
-  const http = raw.split(';').find(p => p.startsWith('http='))?.slice('http='.length) ?? raw;
-  if (!http) return { url: '', source: 'none' };
-  return { url: http, source: 'system(Windows)' };
+  if (!raw.includes('=')) return { url: raw, source: 'system(Windows)' };
+  // Per-scheme form: prefer the http entry, then https, then socks (which
+  // Internet Options means as SOCKS, so it must not become an HTTP proxy).
+  const entries = new Map(
+    raw.split(';').map(p => p.trim()).filter(Boolean).map(p => {
+      const eq = p.indexOf('=');
+      return [p.slice(0, eq).trim().toLowerCase(), p.slice(eq + 1).trim()] as const;
+    }),
+  );
+  const http = entries.get('http') || entries.get('https');
+  if (http) return { url: http, source: 'system(Windows)' };
+  const socks = entries.get('socks');
+  if (socks) return { url: `socks5://${socks}`, source: 'system(Windows)' };
+  return { url: '', source: 'none' };
 }
 
 /** GNOME desktop proxy in manual mode (gsettings). */
@@ -531,7 +560,7 @@ async function resolveDispatcher(): Promise<{ dispatcher: unknown; isSocks: bool
  * written to `requests.request_type` so the abort message and the row
  * column agree on terminology.
  */
-export type ProxyRequestType = 'chat' | 'embedding' | 'image' | 'video' | 'audio' | 'transcription' | 'unknown';
+export type ProxyRequestType = 'chat' | 'embedding' | 'image' | 'video' | 'audio' | 'transcription' | 'moderation' | 'search' | 'decision' | 'unknown';
 
 /**
  * Build an AbortError DOMException whose `message` carries a compact triage
@@ -574,6 +603,33 @@ export function describeAbort(
   }
   const seconds = Math.max(1, Math.round(timeoutMs / 1000));
   return `${p}, ${t}, ${seconds}s`;
+}
+
+/**
+ * undici reports every connection that never opened as a bare "fetch failed"
+ * and keeps the reason (ENOTFOUND, ECONNREFUSED, a certificate error) in
+ * `err.cause`, which never reached the attempt trail, the logs or the client.
+ * A DNS failure, a dead proxy and TLS-intercepting antivirus all looked the
+ * same (#1373). Append the cause code and the upstream host so the message
+ * says which it was. "fetch failed" stays as the prefix, which the
+ * retry classifier matches on.
+ */
+export function describeFetchFailure(err: unknown, url: string, platform?: string): void {
+  if (!(err instanceof TypeError) || err.message !== 'fetch failed') return;
+  let code = '';
+  const seen = new Set<unknown>();
+  let cur: any = err.cause;
+  for (let depth = 0; cur && typeof cur === 'object' && !seen.has(cur) && depth < 5; depth++) {
+    seen.add(cur);
+    if (typeof cur.code === 'string' && cur.code) { code = cur.code; break; }
+    cur = cur.cause;
+  }
+  if (!code) return;
+  let host = '';
+  try { host = new URL(url).hostname; } catch { /* leave it out */ }
+  const proxied = _proxyEnabled && !!(perKeyProxyStore.getStore() || _proxyUrl) && !shouldBypassProxy(url, platform);
+  const parts = [code, host, proxied ? 'via proxy' : ''].filter(Boolean);
+  err.message = `fetch failed (${parts.join(' ')})`;
 }
 
 /**
@@ -803,11 +859,53 @@ export async function proxyFetch(
     }
     return response;
   } catch (err) {
+    describeFetchFailure(err, url, platform);
     // Rewrite bare "The operation was aborted" rejections so they carry the
     // compact triage tag. Preserves the AbortError name so
     // `isRetryableError()` still classifies the failure as retryable.
     throw enrichAbort(err, platform, requestType, timeoutMs);
   }
+}
+
+/**
+ * Opt-in no-direct-egress policy for sensitive platforms.
+ *
+ * PROXY_REQUIRED_PLATFORMS=google means that any Google provider request
+ * without a working proxy transport must fail rather than silently go direct.
+ * This is independent of model failover (which the request router controls).
+ */
+function requiresOutboundProxy(platform?: string): boolean {
+  if (!platform) return false;
+  return readEnv('PROXY_REQUIRED_PLATFORMS')
+    .split(',')
+    .some(value => value.trim().toLowerCase() === platform.toLowerCase());
+}
+
+function proxyRequiredError(platform: string | undefined, reason: string): Error {
+  return Object.assign(
+    new Error(`Outbound proxy required for ${platform ?? 'unknown'}: ${reason}`),
+    { code: 'PROXY_REQUIRED_UNAVAILABLE' },
+  );
+}
+
+/** Native WebSockets use the same HTTP CONNECT/per-key proxy policy as fetch.
+ * A Fetch Relay or SOCKS dispatcher cannot carry this upgrade through undici;
+ * fail explicitly instead of silently leaking a credential on a direct path.
+ * Lazy import also keeps undici out of the ordinary startup path. */
+export async function openProviderWebSocket(url: string, platform: string, options: { protocols?: string[]; headers?: Record<string, string> } = {}): Promise<import('undici').WebSocket> {
+  if (!_initialized) applyProxyUrl('');
+  const perKey = perKeyProxyStore.getStore() ?? '';
+  let dispatcher: unknown;
+  if (shouldBypassProxy(url, platform) || (!perKey && !_proxyUrl)) {
+    if (requiresOutboundProxy(platform)) throw proxyRequiredError(platform, 'proxy routing disabled or bypassed');
+  } else {
+    if (!perKey && _proxyMode === 'fetch-relay') throw new Error('Native WebSockets require a forward proxy, not a Fetch Relay');
+    const resolved = perKey ? await resolvePerKeyDispatcher(perKey) : await resolveDispatcher();
+    if (!resolved || resolved.isSocks) throw new Error('Native WebSockets require a working HTTP/HTTPS forward proxy; no direct fallback was attempted');
+    dispatcher = resolved.dispatcher;
+  }
+  const { WebSocket } = await import('undici');
+  return new WebSocket(url, { ...options, ...(dispatcher ? { dispatcher: dispatcher as import('undici').Dispatcher } : {}) });
 }
 
 /** Route the request through the configured proxy (or straight to fetch). */
@@ -822,6 +920,7 @@ async function dispatchFetch(
   // call) takes precedence over the global proxy for THIS request. Empty
   // string (the store default) means "fall back to global".
   const perKeyUrl = perKeyProxyStore.getStore() ?? '';
+  const proxyRequired = requiresOutboundProxy(platform);
   if (perKeyUrl) {
     // Every bypass still applies, unchanged: the global on/off switch, the
     // per-platform bypass list, NO_PROXY, and local/LAN destinations. A
@@ -836,14 +935,20 @@ async function dispatchFetch(
         }
         return fetch(url, { ...init, dispatcher: resolved.dispatcher } as unknown as RequestInit);
       }
+      if (proxyRequired) {
+        throw proxyRequiredError(platform, 'per-key proxy agent unavailable');
+      }
     }
-    // Per-key proxy failed to build → fall through to the global/direct path.
+    // Non-required platforms keep their historical global/direct fallback.
   }
 
   // Bypass check: disabled globally, this platform is exempt, the upstream
   // host is listed in NO_PROXY, or it is a local/LAN destination no proxy can
   // reach (#951).
   if (shouldBypassProxy(url, platform)) {
+    if (proxyRequired) {
+      throw proxyRequiredError(platform, 'proxy routing disabled or bypassed');
+    }
     return fetch(url, init);
   }
 
@@ -853,8 +958,12 @@ async function dispatchFetch(
 
   const resolved = await resolveDispatcher();
 
-  // No dispatcher (no proxy URL configured, or it failed to build) → direct
+  // For required platforms, a missing/failed proxy agent is never a
+  // reason to attempt direct egress (including cached constructor failures).
   if (!resolved) {
+    if (proxyRequired) {
+      throw proxyRequiredError(platform, 'proxy not configured or proxy agent unavailable');
+    }
     return fetch(url, init);
   }
 

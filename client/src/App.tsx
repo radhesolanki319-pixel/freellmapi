@@ -1,7 +1,7 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Link, useLocation, useNavigate } from 'react-router-dom'
 import { MutationCache, QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { ChevronDown, KeyRound, LogOut, Menu, MoreHorizontal, Search, Settings, Sparkles } from 'lucide-react'
+import { ChevronDown, KeyRound, LogOut, Menu, MoreHorizontal, RefreshCw, Search, Settings, Sparkles } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -19,8 +19,11 @@ import { CommandPalette } from '@/components/command-palette'
 import { openCommandPalette } from '@/components/command-palette-state'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { SettingsDialog } from '@/components/settings-dialog'
+import { UpdatesDialog } from '@/components/updates-dialog'
+import { OPEN_UPDATES_EVENT } from '@/lib/updates'
 import { Toaster } from '@/components/toaster'
 import { UpdateReminder } from '@/components/update-reminder'
+import { NewBuildPrompt } from '@/components/new-build-prompt'
 import { usePremium } from '@/hooks/use-premium'
 import { I18nProvider, useI18n } from '@/i18n'
 import { logout } from '@/lib/api'
@@ -35,6 +38,8 @@ import EmbeddingsPage from '@/pages/EmbeddingsPage'
 import ImagePage from '@/pages/ImagePage'
 import VideoPage from '@/pages/VideoPage'
 import AudioPage from '@/pages/AudioPage'
+import SearchPage from '@/pages/SearchPage'
+import DecisionPage from '@/pages/DecisionPage'
 import MediaDetailPage from '@/pages/MediaDetailPage'
 import EmbeddingDetailPage from '@/pages/EmbeddingDetailPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
@@ -78,10 +83,12 @@ const navItems = [
 // first landing on the chat table.
 const modelItems = [
   { to: '/models/chat', labelKey: 'models.chatModelsTab' },
-  { to: '/models/embeddings', labelKey: 'models.embeddingsTab' },
   { to: '/models/image', labelKey: 'models.imageTab' },
   { to: '/models/video', labelKey: 'models.videoTab' },
   { to: '/models/audio', labelKey: 'models.audioTab' },
+  { to: '/models/embeddings', labelKey: 'models.embeddingsTab' },
+  { to: '/models/decision', labelKey: 'decision.tab' },
+  { to: '/models/search', labelKey: 'search.tab' },
   { to: '/models/fusion', labelKey: 'models.fusionTab' },
 ]
 
@@ -146,34 +153,49 @@ function Brand() {
 const isDesktopApp = typeof window !== 'undefined'
   && (window as Window & { __FREEAPI_DESKTOP__?: boolean }).__FREEAPI_DESKTOP__ === true
 
+const desktopPlatform = typeof window !== 'undefined'
+  ? (window as Window & { __FREEAPI_PLATFORM__?: string }).__FREEAPI_PLATFORM__
+  : undefined
+
+const isMacDesktop = isDesktopApp && (
+  desktopPlatform ? desktopPlatform === 'darwin' : (typeof navigator !== 'undefined' && /Macintosh|Mac OS X/.test(navigator.userAgent))
+)
+
 // The preload's own early classList.add can be lost (it may run before this
 // document exists), so the client claims the class itself at module load —
 // before the first React paint — keeping html.desktop CSS (transparent body,
-// glass backdrop) reliable.
+// glass backdrop on macOS) reliable.
 if (isDesktopApp) {
   document.documentElement.classList.add('desktop')
+  if (isMacDesktop) {
+    document.documentElement.classList.add('desktop-mac')
+  }
 }
 
 function AccountMenuItems({
   showUpgrade,
   upgradeLabel,
   settingsLabel,
+  updatesLabel,
   signOutLabel,
   changeEmailLabel,
   changePasswordLabel,
   onUpgrade,
   onOpenSettings,
+  onOpenUpdates,
   onChangeEmail,
   onChangePassword,
 }: {
   showUpgrade: boolean
   upgradeLabel: string
   settingsLabel: string
+  updatesLabel: string
   signOutLabel: string
   changeEmailLabel: string
   changePasswordLabel: string
   onUpgrade: () => void
   onOpenSettings: () => void
+  onOpenUpdates: () => void
   onChangeEmail: () => void
   onChangePassword: () => void
 }) {
@@ -188,6 +210,10 @@ function AccountMenuItems({
       <DropdownMenuItem onClick={onOpenSettings}>
         <Settings />
         {settingsLabel}
+      </DropdownMenuItem>
+      <DropdownMenuItem onClick={onOpenUpdates}>
+        <RefreshCw />
+        {updatesLabel}
       </DropdownMenuItem>
       {/* Desktop signs in with a hidden local account, so it has no credentials
           to change and no session to end. */}
@@ -217,6 +243,13 @@ function Navbar() {
   const location = useLocation()
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [updatesOpen, setUpdatesOpen] = useState(false)
+  // The update pill lives outside the navbar; it asks for this dialog by event.
+  useEffect(() => {
+    const open = () => setUpdatesOpen(true)
+    window.addEventListener(OPEN_UPDATES_EVENT, open)
+    return () => window.removeEventListener(OPEN_UPDATES_EVENT, open)
+  }, [])
   const [credentialsMode, setCredentialsMode] = useState<'password' | 'email' | null>(null)
   const { data: premium, licensed, isLoading: premiumLoading, isError: premiumError } = usePremium()
   const showUpgrade = Boolean(premium) && !licensed && !premiumLoading && !premiumError
@@ -224,17 +257,17 @@ function Navbar() {
   return (
     <>
       <header
-        // In the desktop shell the body backdrop is already translucent glass;
-        // a lighter wash keeps the title bar from looking more solid than the page.
-        className={`sticky top-0 z-40 border-b backdrop-blur ${isDesktopApp ? 'bg-background/45' : 'bg-background/80'}`}
+        // In macOS desktop shell the window carries vibrancy blur, so a lighter wash (45%)
+        // lets it read as glass. Everywhere else (Windows/Linux/browser), use solid wash (80%)
+        // so text and contrast stay sharp and readable.
+        className={`sticky top-0 z-40 border-b backdrop-blur ${isMacDesktop ? 'bg-background/45' : 'bg-background/80'}`}
         style={isDesktopApp ? ({ WebkitAppRegion: 'drag' } as React.CSSProperties) : undefined}
       >
         <div
-          // Physical pl (not logical ps): the gutter reserves the macOS
-          // traffic lights, which stay top-left even when an RTL locale
-          // flips the document direction.
-          className={`mx-auto flex max-w-6xl items-center px-4 sm:px-6 ${isDesktopApp ? 'pl-20 sm:pl-20' : ''}`}
-          style={isDesktopApp ? { minHeight: 52 } : undefined}
+          // Physical pl: reserves macOS traffic lights only on macOS. On Windows and Linux,
+          // standard window controls sit on the top-right, so no left padding is needed.
+          className={`mx-auto flex max-w-6xl items-center px-4 sm:px-6 ${isMacDesktop ? 'pl-20 sm:pl-20' : ''}`}
+          style={isMacDesktop ? { minHeight: 52 } : undefined}
         >
           <Brand />
           <nav
@@ -296,11 +329,13 @@ function Navbar() {
                   showUpgrade={showUpgrade}
                   upgradeLabel={t('nav.upgrade')}
                   settingsLabel={t('nav.settings')}
+                  updatesLabel={t('settings.checkForUpdates')}
                   signOutLabel={t('nav.signOut')}
                   changeEmailLabel={t('auth.changeEmail')}
                   changePasswordLabel={t('auth.changePassword')}
                   onUpgrade={() => navigate('/premium')}
                   onOpenSettings={() => setSettingsOpen(true)}
+                  onOpenUpdates={() => setUpdatesOpen(true)}
                   onChangeEmail={() => setCredentialsMode('email')}
                   onChangePassword={() => setCredentialsMode('password')}
                 />
@@ -350,11 +385,13 @@ function Navbar() {
                   showUpgrade={showUpgrade}
                   upgradeLabel={t('nav.upgrade')}
                   settingsLabel={t('nav.settings')}
+                  updatesLabel={t('settings.checkForUpdates')}
                   signOutLabel={t('nav.signOut')}
                   changeEmailLabel={t('auth.changeEmail')}
                   changePasswordLabel={t('auth.changePassword')}
                   onUpgrade={() => navigate('/premium')}
                   onOpenSettings={() => setSettingsOpen(true)}
+                  onOpenUpdates={() => setUpdatesOpen(true)}
                   onChangeEmail={() => setCredentialsMode('email')}
                   onChangePassword={() => setCredentialsMode('password')}
                 />
@@ -364,6 +401,7 @@ function Navbar() {
         </div>
       </header>
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <UpdatesDialog open={updatesOpen} onOpenChange={setUpdatesOpen} />
       {credentialsMode && (
         <ChangeCredentialsModal mode={credentialsMode} onClose={() => setCredentialsMode(null)} />
       )}
@@ -417,7 +455,7 @@ function AppShell({ children }: { children: ReactNode }) {
   const location = useLocation()
   const fullBleed = FULL_BLEED_ROUTES.has(location.pathname)
   return (
-    <div className={`flex flex-col ${fullBleed ? 'h-dvh overflow-hidden' : 'min-h-screen'} ${isDesktopApp ? 'desktop-backdrop' : 'bg-background'}`}>
+    <div className={`flex flex-col ${fullBleed ? 'h-dvh overflow-hidden' : 'min-h-screen'} ${isMacDesktop ? 'desktop-backdrop' : 'bg-background'}`}>
       {children}
     </div>
   )
@@ -453,6 +491,8 @@ function App() {
                       <Route path="/models/audio" element={<AudioPage />} />
                       <Route path="/models/audio/:id" element={<MediaDetailPage modality="audio" />} />
                       <Route path="/models/transcription/:id" element={<MediaDetailPage modality="transcription" />} />
+                      <Route path="/models/search" element={<SearchPage />} />
+                      <Route path="/models/decision" element={<DecisionPage />} />
                       <Route path="/playground" element={<PlaygroundPage />} />
                       <Route path="/keys" element={<KeysPage />} />
                       <Route path="/agents" element={<AgentsPage />} />
@@ -469,6 +509,7 @@ function App() {
                 <Toaster />
                 <CommandPalette />
                 <UpdateReminder />
+                <NewBuildPrompt />
               </AppShell>
             </AuthGate>
           </BrowserRouter>

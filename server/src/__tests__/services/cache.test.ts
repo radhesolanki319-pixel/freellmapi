@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, setSetting, getDb } from '../../db/index.js';
 import {
   computeCacheKey,
@@ -181,6 +181,25 @@ describe('response cache', () => {
       expect(computeCacheKey({ model: 'auto', messages, logprobs: true })).not.toBe(base);
       expect(computeCacheKey({ model: 'auto', messages, logprobs: true, top_logprobs: 5 }))
         .not.toBe(computeCacheKey({ model: 'auto', messages, logprobs: true }));
+    });
+
+    it('changes when top_k, min_p, repetition_penalty, or parallel_tool_calls change', () => {
+      // These are forwarded upstream as extended sampling params, so two
+      // requests differing only in one of them ask for different answers.
+      const messages = [msg('user', 'hello')];
+      const base = computeCacheKey({ model: 'auto', messages });
+      expect(computeCacheKey({ model: 'auto', messages, top_k: 40 })).not.toBe(base);
+      expect(computeCacheKey({ model: 'auto', messages, top_k: 40 }))
+        .not.toBe(computeCacheKey({ model: 'auto', messages, top_k: 1 }));
+      expect(computeCacheKey({ model: 'auto', messages, min_p: 0.1 })).not.toBe(base);
+      expect(computeCacheKey({ model: 'auto', messages, repetition_penalty: 1.2 })).not.toBe(base);
+      expect(computeCacheKey({ model: 'auto', messages, parallel_tool_calls: false })).not.toBe(base);
+      // Absent knobs still hash like before.
+      expect(computeCacheKey({
+        model: 'auto', messages,
+        top_k: undefined, min_p: undefined, repetition_penalty: undefined, parallel_tool_calls: undefined,
+      }))
+        .toBe(base);
     });
 
     it('identical requests with the new knobs present collapse to the same key', () => {
@@ -680,6 +699,70 @@ describe('response cache', () => {
       expect(getCachedResponse(key, t0 + 120_000)).toBeNull();
       __flushPersistenceForTests();
       expect(rowCount()).toBe(0);
+    });
+
+    describe('batched hit-count flush', () => {
+      const hitRow = (key: string) => getDb()
+        .prepare('SELECT hit_count, last_hit_at_ms FROM response_cache WHERE cache_key = ?')
+        .get(key) as { hit_count: number; last_hit_at_ms: number | null } | undefined;
+
+      beforeEach(() => { vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }); });
+      afterEach(() => { vi.useRealTimers(); });
+
+      it('writes many hits in one debounced pass', () => {
+        const key = computeCacheKey({ model: 'auto', messages: [msg('user', 'batched')] });
+        const t0 = 5_000_000;
+        store(key, 'answer', t0);
+        __flushPersistenceForTests();
+        getCachedResponse(key, t0 + 1);
+        getCachedResponse(key, t0 + 2);
+        getCachedResponse(key, t0 + 3);
+        __flushPersistenceForTests();
+        // Nothing written per hit: the row still holds the stored value.
+        expect(hitRow(key)!.hit_count).toBe(0);
+
+        vi.advanceTimersByTime(2_000);
+        __flushPersistenceForTests();
+        expect(hitRow(key)).toEqual({ hit_count: 3, last_hit_at_ms: t0 + 3 });
+      });
+
+      it('clearCache() drops pending counts so they never land on a re-stored entry', () => {
+        const key = computeCacheKey({ model: 'auto', messages: [msg('user', 'cleared-pending')] });
+        store(key, 'old answer');
+        __flushPersistenceForTests();
+        getCachedResponse(key);
+        getCachedResponse(key);
+
+        clearCache();
+        store(key, 'fresh answer');
+        __flushPersistenceForTests();
+        vi.advanceTimersByTime(2_000);
+        __flushPersistenceForTests();
+
+        expect(hitRow(key)!.hit_count).toBe(0);
+        expect(getCacheStats().totalHits).toBe(0);
+      });
+
+      it('a re-store drops the old entry\'s pending count', () => {
+        const key = computeCacheKey({ model: 'auto', messages: [msg('user', 'restored-pending')] });
+        store(key, 'old answer');
+        __flushPersistenceForTests();
+        getCachedResponse(key);
+        getCachedResponse(key);
+
+        // Overwrite before the flush timer fires: the fresh row starts at 0.
+        store(key, 'new answer');
+        __flushPersistenceForTests();
+        vi.advanceTimersByTime(2_000);
+        __flushPersistenceForTests();
+        expect(hitRow(key)!.hit_count).toBe(0);
+
+        // Hits on the new entry still flush normally.
+        getCachedResponse(key);
+        vi.advanceTimersByTime(2_000);
+        __flushPersistenceForTests();
+        expect(hitRow(key)!.hit_count).toBe(1);
+      });
     });
 
     it('clearCache() purges SQLite too, so a restart does not resurrect entries', () => {

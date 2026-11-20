@@ -134,6 +134,24 @@ describe('Analytics API', () => {
     expect(body.totalRequests).toBe(2);
   });
 
+  it('range=all reports the unpruned lifetime headline totals', async () => {
+    // Rows far older than any retention window, plus a recent one. The
+    // lifetime counters in `settings` span all of them, so 'all' must total
+    // every inserted row, not merely the retained window.
+    insertRequest('2026-01-01 00:00:00');
+    insertRequest('2026-03-15 08:00:00');
+    insertRequest('2026-05-29 11:59:59');
+
+    const { status, body } = await request(app, '/api/analytics/summary?range=all');
+
+    expect(status).toBe(200);
+    expect(body.totalRequests).toBe(3);
+    expect(body.totalInputTokens).toBe(3);
+    expect(body.totalOutputTokens).toBe(6);
+    expect(body.lifetimeTotalRequests).toBe(3);
+    expect(body.firstRequestAt).toBe('2026-01-01 00:00:00');
+  });
+
   // Regression guard for the hour-key FORMAT written by the real production
   // writer (lib/request-log.logRequest). The bug this prevents: the writer
   // stores keys as SQLite's 'YYYY-MM-DD HH:00:00' (space), but the summary
@@ -769,6 +787,30 @@ describe('Analytics API', () => {
       expect(body.byCategory.find((c: any) => c.category === 'Rate Limited (429)').count).toBe(2);
     });
 
+    it('classifies capitalized upstream auth and timeout messages out of Other', async () => {
+      // The messages upstream providers actually send. LIKE is case-sensitive
+      // in SQLite and the old '%invalid.*key%' pattern was regex syntax inside
+      // a LIKE (where '.' and '*' are literals), so "Invalid API key" and
+      // "Timeout" both fell into 'Other' and the dashboard hid auth failures.
+      insertRaw({ status: 'error', error: 'Invalid API key: sk-broken', createdAt: '2026-05-29 11:00:00' });
+      insertRaw({ status: 'error', error: 'Unauthorized: token expired', createdAt: '2026-05-29 11:01:00' });
+      insertRaw({ status: 'error', error: 'Too Many Requests', createdAt: '2026-05-29 11:02:00' });
+      insertRaw({ status: 'error', error: 'Timeout awaiting response headers', createdAt: '2026-05-29 11:03:00' });
+      insertRaw({ status: 'error', error: 'ETIMEDOUT after 30000ms', createdAt: '2026-05-29 11:04:00' });
+      // "timed out" is how our own abort paths word it; the '%500%' rule used to
+      // claim this one via the "5000ms" in the message.
+      insertRaw({ status: 'error', error: 'fusion tool call timed out after 5000ms', createdAt: '2026-05-29 11:05:00' });
+
+      const { status, body } = await request(app, '/api/analytics/error-distribution?range=24h');
+      expect(status).toBe(200);
+
+      const cat = (name: string) => body.byCategory.find((c: any) => c.category === name)?.count ?? 0;
+      expect(cat('Auth Error (401)')).toBe(2);
+      expect(cat('Rate Limited (429)')).toBe(1);
+      expect(cat('Timeout/Connection')).toBe(3);
+      expect(cat('Other')).toBe(0);
+    });
+
     it('filters recent calls by the bare "custom" id to the orphaned rows only', async () => {
       // The bare id is what /by-platform emits for rows whose endpoint is
       // unknown. Selecting it must return exactly the rows that row counted —
@@ -821,6 +863,20 @@ describe('Analytics API', () => {
         const res = await request(app, '/api/analytics/requests?range=24h&provider=' + encodeURIComponent(bad));
         expect(res.status).toBe(400);
       }
+    });
+
+    it('takes the FIRST value of a repeated provider/status param instead of crashing', async () => {
+      // Express hands back an ARRAY for a repeated query param. The provider
+      // shape check then dies on `provider.startsWith(...)` — arrays have no
+      // such method — and the dashboard's recent-calls panel shows a 500 for
+      // what is at worst a client bug. Same contract as routes/logs.ts:
+      // first value wins, repeated params are not two filters.
+      const dup = await request(app, '/api/analytics/requests?range=24h&provider=groq&provider=openrouter');
+      expect(dup.status).toBe(200);
+      const badSecond = await request(app, '/api/analytics/requests?range=24h&provider=groq&provider=' + encodeURIComponent('has spaces'));
+      expect(badSecond.status).toBe(200);
+      const dupStatus = await request(app, '/api/analytics/requests?range=24h&status=success&status=error');
+      expect(dupStatus.status).toBe(200);
     });
   });
 });

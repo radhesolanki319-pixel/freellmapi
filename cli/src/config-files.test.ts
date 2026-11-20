@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parse } from 'jsonc-parser';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { applyGeneratedFile, applyGeneratedFiles, renderFile } from './config-files.js';
 
 const temporary: string[] = [];
@@ -14,6 +14,70 @@ afterEach(() => {
 });
 
 describe('safe config writes', () => {
+  it('writes a fresh env file without a leading blank line', () => {
+    const rendered = renderFile({ path: '/unused', format: 'env', content: 'FREELLMAPI_API_KEY=k\n' }, '');
+    expect(rendered).toBe('FREELLMAPI_API_KEY=k\n');
+    expect(renderFile({ path: '/unused', format: 'env', content: 'FREELLMAPI_API_KEY=k\n' }, rendered)).toBe(rendered);
+  });
+
+  it('appends a new env key without leaving a blank line before it', () => {
+    const merged = renderFile(
+      { path: '/unused/.env', format: 'env', content: 'FREELLMAPI_API_KEY=k\n' },
+      'DEEPSEEK_API_KEY=sk-keep\n',
+    );
+    expect(merged).toBe('DEEPSEEK_API_KEY=sk-keep\nFREELLMAPI_API_KEY=k\n');
+  });
+
+  it('merges keyed JSON arrays per owner instead of replacing them (ZCode)', () => {
+    const existing = JSON.stringify({
+      schemaVersion: 1,
+      config: {
+        providerConfigRules: { providerRules: [
+          { providerId: 'local', providerName: 'Mine' },
+          { providerId: 'freellmapi', providerName: 'Old' },
+        ] },
+        modelConfigRules: {
+          providerModelRules: [{ providerId: 'local', modelId: 'm' }, { providerId: 'freellmapi', modelId: 'gone' }],
+          manualProviderModelRules: [{ providerId: 'freellmapi', modelId: 'fast' }, { providerId: 'local', modelId: 'x' }],
+        },
+        providerOrder: ['local', 'freellmapi'],
+      },
+    }, null, 2);
+    const file = {
+      path: '/unused/provider_config.json',
+      format: 'json' as const,
+      arrays: {
+        'config.providerConfigRules.providerRules': { ownedBy: { providerId: 'freellmapi' } },
+        'config.modelConfigRules.providerModelRules': { ownedBy: { providerId: 'freellmapi' } },
+        'config.modelConfigRules.manualProviderModelRules': { ownedBy: { providerId: 'freellmapi' } },
+        'config.providerOrder': { union: true as const },
+      },
+      value: {
+        config: {
+          providerConfigRules: { providerRules: [{ providerId: 'freellmapi', providerName: 'FreeLLMAPI' }] },
+          modelConfigRules: {
+            providerModelRules: [{ providerId: 'freellmapi', modelId: 'fast' }],
+            manualProviderModelRules: [],
+          },
+          providerOrder: ['freellmapi'],
+        },
+      },
+    };
+    const once = renderFile(file, existing);
+    const merged = parse(once).config;
+    expect(merged.providerConfigRules.providerRules).toEqual([
+      { providerId: 'local', providerName: 'Mine' },
+      { providerId: 'freellmapi', providerName: 'FreeLLMAPI' },
+    ]);
+    expect(merged.modelConfigRules.providerModelRules).toEqual([
+      { providerId: 'local', modelId: 'm' },
+      { providerId: 'freellmapi', modelId: 'fast' },
+    ]);
+    expect(merged.modelConfigRules.manualProviderModelRules).toEqual([{ providerId: 'local', modelId: 'x' }]);
+    expect(merged.providerOrder).toEqual(['local', 'freellmapi']);
+    expect(renderFile(file, once)).toBe(once);
+  });
+
   it('renders a fresh Continue config idempotently', () => {
     const generated = [
       '# freellmapi:start',
@@ -435,6 +499,58 @@ describe('safe config writes', () => {
     expect(renderFile({ path: '/unused', format: 'toml', content: generated }, merged)).toBe(merged);
   });
 
+  it('merges a Reasonix config: replaces only the [[providers]] entry with the same name', () => {
+    // Reasonix keeps every endpoint as a `[[providers]]` array entry. A rerun
+    // must swap the stale freellmapi entry (and its sub-table) for the new one
+    // and leave the deepseek entry, the [desktop] table and root keys alone.
+    const existing = [
+      'config_version = 1',
+      'default_model = "deepseek/deepseek-flash"',
+      '',
+      '[desktop]',
+      'provider_access = ["deepseek"]',
+      '',
+      '[[providers]]',
+      'name        = "deepseek"',
+      'kind        = "openai"',
+      'api_key_env = "DEEPSEEK_API_KEY"',
+      '',
+      '[[providers]]',
+      "name = 'freellmapi'",
+      'base_url = "http://stale:9/v1"',
+      '',
+      '[providers.model_overrides]',
+      'stale = { context_window = 1 }',
+      '',
+      '[[plugins]]',
+      'name = "freellmapi"',
+      'command = "keep-me"',
+      '',
+    ].join('\n');
+    const generated = [
+      'default_model = "freellmapi/auto"',
+      '',
+      '[[providers]]',
+      'name = "freellmapi"',
+      'kind = "openai"',
+      'base_url = "http://localhost:3001/v1"',
+      'models = ["auto"]',
+    ].join('\n');
+    const merged = renderFile({ path: '/unused', format: 'toml', content: generated }, existing);
+    const lines = merged.split('\n');
+    const firstTable = lines.findIndex(line => line.startsWith('['));
+    expect(lines.slice(0, firstTable)).toContain('default_model = "freellmapi/auto"');
+    expect(lines.slice(0, firstTable)).toContain('config_version = 1');
+    expect(merged.match(/^default_model =/gm)).toHaveLength(1);
+    expect(merged).toContain('[desktop]\nprovider_access = ["deepseek"]');
+    expect(merged).toContain('name        = "deepseek"\nkind        = "openai"');
+    expect(merged).toContain('[[plugins]]\nname = "freellmapi"\ncommand = "keep-me"');
+    expect(merged.match(/^\[\[providers\]\]$/gm)).toHaveLength(2);
+    expect(merged).not.toContain('stale');
+    expect(merged).toContain('base_url = "http://localhost:3001/v1"');
+    expect(renderFile({ path: '/unused', format: 'toml', content: generated }, merged)).toBe(merged);
+  });
+
   it('creates a timestamped backup before replacing a real file', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'freellmapi-cli-'));
     temporary.push(directory);
@@ -449,6 +565,41 @@ describe('safe config writes', () => {
     expect(fs.readFileSync(result.backupPath!, 'utf8')).toBe('user_setting = true\n');
     expect(fs.readFileSync(target, 'utf8')).toContain('user_setting = true');
     expect(fs.readFileSync(target, 'utf8')).toContain('model = "auto"');
+  });
+
+  it('merges Cordis profile overlays by id and keeps other providers and comments', () => {
+    const file = { format: 'yaml-entries' as const, path: 'cordis.patch.yml',
+      value: { 'llm-pi-ai': { providers: { freellmapi: { apiKeyEnv: 'FREELLMAPI_API_KEY' } } } } };
+    const existing = '# user overlay\n- id: llm-pi-ai\n  config:\n    providers:\n      existing: {apiKeyEnv: KEEP}\n- id: hmr\n  disabled: true\n';
+    const rendered = renderFile(file, existing);
+    expect(rendered).toContain('# user overlay');
+    expect(rendered).toContain('KEEP');
+    expect(rendered).toContain('disabled: true');
+    expect(rendered).toContain('FREELLMAPI_API_KEY');
+    expect(renderFile(file, rendered)).toBe(rendered);
+    expect(() => renderFile(file, 'other: mapping')).toThrow('Expected a YAML patch sequence');
+  });
+
+  it('restores earlier files if a later replacement fails, and a retry succeeds', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'freellmapi-cli-'));
+    temporary.push(directory);
+    const files = ['existing', 'new', 'locked'].map(name => ({
+      path: path.join(directory, name), format: 'env' as const, sensitive: true, content: 'KEY=new\n',
+    }));
+    fs.writeFileSync(files[0].path, 'KEY=old\n');
+    const renameSync = fs.renameSync;
+    const rename = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (to === files[2].path) throw new Error('file locked');
+      renameSync(from, to);
+    });
+    try {
+      expect(() => applyGeneratedFiles(files, false)).toThrow('file locked');
+    } finally { rename.mockRestore(); }
+    expect(fs.readFileSync(files[0].path, 'utf8')).toBe('KEY=old\n');
+    expect(fs.existsSync(files[1].path)).toBe(false);
+    expect(fs.existsSync(files[2].path)).toBe(false);
+    expect(fs.readdirSync(directory).some(file => file.endsWith('.tmp'))).toBe(false);
+    expect(applyGeneratedFiles(files, false).every(file => file.changed)).toBe(true);
   });
 
   it('does not write in dry-run mode', () => {

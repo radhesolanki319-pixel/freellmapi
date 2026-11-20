@@ -17,7 +17,11 @@ function sha256(s: string): string {
   return crypto.createHash('sha256').update(s).digest('hex');
 }
 
-function normalizeEmail(email: string): string {
+/** The one spelling of an address the DB is keyed on. Exported so callers that
+ *  bucket by email (the login throttle in routes/auth.ts) key on exactly what
+ *  verifyCredentials will look up — keying on anything else lets a padded
+ *  address authenticate against the real row while landing in its own bucket. */
+export function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
@@ -51,6 +55,18 @@ export function verifyCredentials(email: string, password: string): SessionUser 
   return { userId: row.id, email: row.email };
 }
 
+/** Desktop app only: a session for the install's account, creating the hidden
+ *  machine account (`desktop@localhost`, random password nobody knows) on first
+ *  run. The desktop window gets this over IPC; a browser tab on the same
+ *  machine gets it from POST /api/auth/desktop-session (routes/auth.ts). */
+export function desktopSessionToken(): string {
+  if (userCount() === 0) {
+    createUser('desktop@localhost', crypto.randomBytes(24).toString('hex'));
+  }
+  const first = getDb().prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get() as { id: number };
+  return createSession(first.id);
+}
+
 /** Mint a session and return the raw token (only the hash is persisted). */
 export function createSession(userId: number): string {
   const token = crypto.randomBytes(32).toString('hex');
@@ -79,6 +95,37 @@ export function validateSession(token: string | undefined | null): SessionUser |
 export function deleteSession(token: string | undefined | null): void {
   if (!token) return;
   getDb().prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+}
+
+// Wrong-password strikes against a signed-in session, shared by every endpoint
+// that re-asks for the dashboard password: change-email, change-password, key
+// export and key reveal (#1885). A stolen session token must not be usable as an
+// unlimited password oracle, so the third wrong password in a row ends the
+// session and the caller has to log in again, where the per-email login
+// lockout applies.
+export const MAX_REAUTH_STRIKES = 3;
+const reauthStrikes = new Map<number, number>();
+
+/** Count a wrong re-entered password. Returns true when this strike ended the
+ * session (the token is deleted), false when the caller may retry. */
+export function recordReauthFailure(userId: number, token: string | undefined | null): boolean {
+  const strikes = (reauthStrikes.get(userId) ?? 0) + 1;
+  if (strikes >= MAX_REAUTH_STRIKES) {
+    reauthStrikes.delete(userId);
+    deleteSession(token);
+    return true;
+  }
+  reauthStrikes.set(userId, strikes);
+  return false;
+}
+
+export function clearReauthFailures(userId: number): void {
+  reauthStrikes.delete(userId);
+}
+
+/** Test hook. */
+export function resetReauthFailures(): void {
+  reauthStrikes.clear();
 }
 
 /** Update the email of the authenticated user after verifying the current password. Throws { code: 'email_taken' } on conflict. */
@@ -113,16 +160,22 @@ export function updatePassword(userId: number, currentPassword: string, newPassw
   return true;
 }
 
+/** The single account's email, or null before first-run setup. */
+export function accountEmail(): string | null {
+  const row = getDb().prepare('SELECT email FROM users LIMIT 1').get() as { email: string } | undefined;
+  return row?.email ?? null;
+}
+
 /**
  * Reset the password for the single existing user and invalidate all
  * sessions.
- * Returns false if no user exists.
+ * Returns the user, or null if no user exists.
  */
-export function resetUserPassword(newPassword: string): boolean {
+export function resetUserPassword(newPassword: string): SessionUser | null {
   const db = getDb();
-  const row = db.prepare('SELECT id FROM users LIMIT 1').get() as { id: number } | undefined;
-  if (!row) return false;
+  const row = db.prepare('SELECT id, email FROM users LIMIT 1').get() as { id: number; email: string } | undefined;
+  if (!row) return null;
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(newPassword), row.id);
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(row.id);
-  return true;
+  return { userId: row.id, email: row.email };
 }

@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { clientNotes, detectChatGptClient } from './detect.js';
 import type {
   CatalogModel,
   GenerateContext,
@@ -125,6 +127,7 @@ function codex(ctx: GenerateContext): Generation {
       content: content.join('\n'),
     }],
     notes: [
+      ...clientNotes(ctx.detectedClient ?? detectChatGptClient()),
       'Export FREELLMAPI_API_KEY before running codex; the key is not written to config.toml.',
       ...(ctx.profile === 'default'
         ? []
@@ -192,8 +195,22 @@ function continueDev(ctx: GenerateContext): Generation {
         '# freellmapi:end',
         '',
       ].join('\n'),
+    },
+    // `${{ secrets.NAME }}` is resolved, in order, from the process
+    // environment, ~/.continue/.env, <cwd>/.continue/.env and <cwd>/.env
+    // before Continue's Hub is consulted. The IDE extensions cannot see the
+    // shell environment, so ~/.continue/.env is the one place that serves the
+    // CLI and the extensions alike — and it keeps the raw key out of the YAML.
+    {
+      path: path.join(ctx.homeDir, '.continue', '.env'),
+      format: 'env',
+      sensitive: true,
+      content: `FREELLMAPI_API_KEY=${ctx.apiKey}\n`,
     }],
-    notes: ['Add FREELLMAPI_API_KEY to Continue secrets; no raw key was written.'],
+    notes: [
+      'The key is in ~/.continue/.env (read by the Continue CLI and the IDE extensions); config.yaml references it as a secret.',
+      'One-shot check with the CLI (npm install -g @continuedev/cli): cn -p "Say hello"',
+    ],
   };
 }
 
@@ -219,39 +236,83 @@ function aider(ctx: GenerateContext): Generation {
   };
 }
 
+// OpenCode resolves `provider/model` refs only against the ids a provider
+// declares, so the default model has to be in the `models` map — `auto`, the
+// usual default, is filtered out of the plain catalog roster, so it goes back
+// at the front. And a provider entry alone is inert: without a top-level
+// `model` OpenCode keeps whatever it used before (or nothing on a fresh
+// install), so the generated config names the default too.
+//
+// The key goes into OpenCode's own credential store, auth.json under its data
+// dir (`$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode` — on Windows
+// too), keyed by the provider id. It used to travel as `{env:FREELLMAPI_API_KEY}`
+// in the config, which only works when the process making the request inherits
+// that variable: a PowerShell `$env:` lasts one window, and the OpenCode desktop
+// app never sees a shell export at all. Worse, the unset placeholder resolves to
+// an empty `apiKey` that overrides a key the user stored with `/connect`, so the
+// gateway answered "Invalid API key" with a perfectly valid key on hand. The
+// config therefore carries no `apiKey`, and an explicit `undefined` retires the
+// placeholder an earlier run wrote. The config dir follows XDG_CONFIG_HOME the
+// same way, since that is where OpenCode reads it from.
 function opencode(ctx: GenerateContext): Generation {
-  const modelEntries = Object.fromEntries(ctx.models
-    .filter(model => model.id !== 'auto')
-    .map(model => [model.id, {
-      name: model.name ?? model.id,
-      limit: { context: contextWindow(model), output: outputLimit(model) },
-    }]));
+  const model = primaryModel(ctx.models, ctx.requestedModelId);
+  const configHome = process.env.XDG_CONFIG_HOME?.trim() || path.join(ctx.homeDir, '.config');
+  const dataHome = process.env.XDG_DATA_HOME?.trim() || path.join(ctx.homeDir, '.local', 'share');
+  const roster = catalogModels(ctx.models);
+  const modelEntries = Object.fromEntries(
+    [model, ...roster.filter(entry => entry.id !== model.id)].map(entry => [entry.id, {
+      name: entry.name ?? entry.id,
+      limit: { context: contextWindow(entry), output: outputLimit(entry) },
+    }]),
+  );
   return {
-    files: [{
-      path: path.join(ctx.homeDir, '.config', 'opencode', 'opencode.json'),
-      format: 'json',
-      value: {
-        $schema: 'https://opencode.ai/config.json',
-        provider: {
-          freellmapi: {
-            npm: '@ai-sdk/openai-compatible',
-            name: 'FreeLLMAPI',
-            options: {
-              baseURL: v1Url(ctx.url),
-              apiKey: '{env:FREELLMAPI_API_KEY}',
+    files: [
+      {
+        path: path.join(configHome, 'opencode', 'opencode.json'),
+        format: 'json',
+        value: {
+          $schema: 'https://opencode.ai/config.json',
+          model: `freellmapi/${model.id}`,
+          provider: {
+            freellmapi: {
+              npm: '@ai-sdk/openai-compatible',
+              name: 'FreeLLMAPI',
+              options: {
+                baseURL: v1Url(ctx.url),
+                apiKey: undefined,
+              },
+              models: modelEntries,
             },
-            models: modelEntries,
           },
         },
       },
-    }],
-    notes: ['Export FREELLMAPI_API_KEY before starting OpenCode.'],
+      {
+        path: path.join(dataHome, 'opencode', 'auth.json'),
+        format: 'json',
+        sensitive: true,
+        value: {
+          freellmapi: { type: 'api', key: ctx.apiKey },
+        },
+      },
+    ],
+    notes: [
+      'The key is stored in OpenCode\'s auth.json, so no environment variable is needed (CLI or desktop app).',
+      `freellmapi/${model.id} is now the default model.`,
+    ],
   };
 }
 
 function goose(ctx: GenerateContext): Generation {
+  const dir = process.env.GOOSE_PATH_ROOT && path.isAbsolute(process.env.GOOSE_PATH_ROOT)
+    ? path.join(process.env.GOOSE_PATH_ROOT, 'config')
+    : process.platform === 'win32'
+      ? path.join(process.env.APPDATA || path.join(ctx.homeDir, 'AppData', 'Roaming'), 'Block', 'goose', 'config')
+      : path.join(ctx.homeDir, '.config', 'goose');
   const model = primaryModel(ctx.models, ctx.requestedModelId);
-  const models = catalogModels(ctx.models).map(entry => ({
+  // GOOSE_MODEL names the default, so it belongs in the provider's list too;
+  // `auto` is filtered out of the plain roster and goes back at the front.
+  const roster = catalogModels(ctx.models);
+  const models = [model, ...roster.filter(entry => entry.id !== model.id)].map(entry => ({
     name: entry.id,
     context_limit: contextWindow(entry),
   }));
@@ -259,9 +320,7 @@ function goose(ctx: GenerateContext): Generation {
     files: [
       {
         path: path.join(
-          ctx.homeDir,
-          '.config',
-          'goose',
+          dir,
           'custom_providers',
           'freellmapi.json',
         ),
@@ -281,7 +340,7 @@ function goose(ctx: GenerateContext): Generation {
         },
       },
       {
-        path: path.join(ctx.homeDir, '.config', 'goose', 'config.yaml'),
+        path: path.join(dir, 'config.yaml'),
         format: 'yaml',
         content: [
           '# freellmapi:start',
@@ -299,7 +358,12 @@ function goose(ctx: GenerateContext): Generation {
 function qwen(ctx: GenerateContext): Generation {
   const model = primaryModel(ctx.models, ctx.requestedModelId);
   const dir = path.join(ctx.homeDir, '.qwen');
-  const models = catalogModels(ctx.models).map(entry => ({
+  // Qwen Code looks the selected model up in the provider list and, finding
+  // nothing, silently falls back to the FIRST listed model — with `auto`
+  // filtered out of the roster that was `fusion`, a multi-model fan-out. The
+  // default goes first so the lookup always succeeds.
+  const roster = catalogModels(ctx.models);
+  const models = [model, ...roster.filter(entry => entry.id !== model.id)].map(entry => ({
     id: entry.id,
     name: entry.name ?? entry.id,
     envKey: 'FREELLMAPI_API_KEY',
@@ -337,36 +401,90 @@ function qwen(ctx: GenerateContext): Generation {
   };
 }
 
+// Roo Code imports a settings file named by `roo-cline.autoImportSettingsPath`
+// and makes that file's `currentApiConfigName` the active profile. The VS Code
+// extension can use an `openai`-type profile (Roo's "OpenAI Compatible"), but
+// the Roo CLI only starts with a provider from its own short list and then
+// forces `apiProvider: openrouter` plus the --model onto whatever profile is
+// CURRENT — so the CLI is served by a separate import file whose current
+// profile is an `openrouter`-type one with the base URL overridden. The two
+// stores never meet: the extension reads VS Code settings, the CLI reads
+// ~/.vscode-mock/global-storage/global-state.json.
 function roo(ctx: GenerateContext): Generation {
   const model = primaryModel(ctx.models, ctx.requestedModelId);
   const importPath = path.join(ctx.homeDir, '.roo', 'freellmapi.json');
+  const cliImportPath = path.join(ctx.homeDir, '.roo', 'freellmapi-cli.json');
+  const cliProfile = {
+    apiProvider: 'openrouter',
+    openRouterBaseUrl: v1Url(ctx.url),
+    openRouterApiKey: ctx.apiKey,
+    openRouterModelId: model.id,
+  };
   return {
-    files: [{
-      path: importPath,
-      format: 'json',
-      sensitive: true,
-      value: {
-        providerProfiles: {
-          currentApiConfigName: 'freellmapi',
-          apiConfigs: {
-            freellmapi: {
-              apiProvider: 'openai',
-              openAiBaseUrl: v1Url(ctx.url),
-              openAiApiKey: ctx.apiKey,
-              openAiModelId: model.id,
+    files: [
+      {
+        path: importPath,
+        format: 'json',
+        sensitive: true,
+        value: {
+          providerProfiles: {
+            currentApiConfigName: 'freellmapi',
+            apiConfigs: {
+              freellmapi: {
+                apiProvider: 'openai',
+                openAiBaseUrl: v1Url(ctx.url),
+                openAiApiKey: ctx.apiKey,
+                openAiModelId: model.id,
+                openAiStreamingEnabled: true,
+                openAiCustomModelInfo: {
+                  contextWindow: contextWindow(model),
+                  maxTokens: outputLimit(model),
+                  supportsPromptCache: false,
+                },
+              },
+              'freellmapi-cli': cliProfile,
             },
           },
+          globalSettings: {},
         },
-        globalSettings: {},
       },
-    }],
-    notes: [`Set Roo Code's autoImportSettingsPath to ${importPath}.`],
+      {
+        path: cliImportPath,
+        format: 'json',
+        sensitive: true,
+        value: {
+          providerProfiles: {
+            currentApiConfigName: 'freellmapi-cli',
+            apiConfigs: { 'freellmapi-cli': cliProfile },
+          },
+          globalSettings: {},
+        },
+      },
+      // The CLI's own defaults file. `provider` is honoured (it guards against
+      // the CLI defaulting to Roo Cloud when a Roo token exists); `model` is
+      // shadowed in Roo CLI 0.1.x by the -m flag's built-in default, so -m is
+      // still needed on the command line until Roo fixes that.
+      {
+        path: path.join(ctx.homeDir, '.roo', 'cli-settings.json'),
+        format: 'json',
+        value: { provider: 'openrouter', model: model.id },
+      },
+    ],
+    notes: [
+      `VS Code: add "roo-cline.autoImportSettingsPath": "${importPath}" to settings.json and reload (or Roo Settings → Import); the freellmapi profile becomes current.`,
+      `Roo CLI: merge {"roo-cline.autoImportSettingsPath": "${cliImportPath}"} into ~/.vscode-mock/global-storage/global-state.json (create it if missing), then:`,
+      `  export OPENROUTER_API_KEY=<unified-key>   # the CLI refuses to start without it, even with the key in the profile`,
+      `  roo -m ${model.id} "Say hello"            # -m is required: the CLI's built-in default model shadows cli-settings.json`,
+    ],
   };
 }
 
 function kilo(ctx: GenerateContext): Generation {
   const model = primaryModel(ctx.models, ctx.requestedModelId);
-  const models = Object.fromEntries(catalogModels(ctx.models).map(entry => [
+  // Kilo refuses to start (`Model not found: openai-compatible/auto`) unless
+  // the selected model is in the provider's map, so the default goes first.
+  const roster = catalogModels(ctx.models);
+  const models = Object.fromEntries([model, ...roster.filter(entry => entry.id !== model.id)].map(entry => [
     entry.id,
     {
       name: entry.name ?? entry.id,
@@ -397,12 +515,21 @@ function kilo(ctx: GenerateContext): Generation {
     }],
     notes: [
       'Export FREELLMAPI_API_KEY before starting Kilo; global config is trusted for {env:…} expansion.',
+      `One-shot check: kilo run "Say hello" — openai-compatible/${model.id} is the default model.`,
     ],
   };
 }
 
+// Crush picks its provider by the top-level `models.large` / `models.small`
+// selection, and with neither set it auto-detects from whatever credentials
+// are on the machine (an AWS profile, ANTHROPIC_API_KEY, a Charm login) — a
+// provider entry alone never gets used. Both slots are pointed at the chosen
+// model, which therefore has to be in the provider's list; `auto` is filtered
+// out of the plain roster, so it goes back at the front.
 function crush(ctx: GenerateContext): Generation {
-  const models = catalogModels(ctx.models).map(entry => ({
+  const model = primaryModel(ctx.models, ctx.requestedModelId);
+  const roster = catalogModels(ctx.models);
+  const models = [model, ...roster.filter(entry => entry.id !== model.id)].map(entry => ({
     id: entry.id,
     name: entry.name ?? entry.id,
     cost_per_1m_in: 0,
@@ -420,6 +547,10 @@ function crush(ctx: GenerateContext): Generation {
       format: 'json',
       value: {
         $schema: 'https://charm.land/crush.json',
+        models: {
+          large: { provider: 'freellmapi', model: model.id },
+          small: { provider: 'freellmapi', model: model.id },
+        },
         providers: {
           freellmapi: {
             name: 'FreeLLMAPI',
@@ -431,7 +562,10 @@ function crush(ctx: GenerateContext): Generation {
         },
       },
     }],
-    notes: ['Export FREELLMAPI_API_KEY before starting Crush.'],
+    notes: [
+      'Export FREELLMAPI_API_KEY before starting Crush.',
+      `freellmapi/${model.id} is now the large and small model.`,
+    ],
   };
 }
 
@@ -464,49 +598,53 @@ function dsh(ctx: GenerateContext): Generation {
       contextWindow: contextWindow(entry),
       maxTokens: outputLimit(entry),
     }));
-  return {
-    files: [
-      {
-        path: path.join(home, 'settings.yaml'),
-        format: 'yaml',
-        value: {
-          'llm-pi-ai': {
-            providers: {
-              [route]: {
-                displayName: ctx.profile === 'default' ? 'FreeLLMAPI' : `FreeLLMAPI (${ctx.profile})`,
-                apiKeyEnv: 'FREELLMAPI_API_KEY',
-                api: 'openai-completions',
-                baseURL: v1Url(ctx.url),
-                models: entries,
-              },
-            },
-          },
-          // The default model is only claimed for the default profile; a
-          // named route is an extra option in the picker, not a takeover.
-          // A previous default's `reasoningEffort` must go with it: DSH
-          // refuses a request naming a level the selected model cannot
-          // take, and a hand-declared model declares none.
-          ...(ctx.profile === 'default'
-            ? {
-              'agent-default-model': {
-                provider: route,
-                model: model.id,
-                reasoningEffort: undefined,
-              },
-            }
-            : {}),
+  const settings = {
+    'llm-pi-ai': {
+      providers: {
+        [route]: {
+          displayName: ctx.profile === 'default' ? 'FreeLLMAPI' : `FreeLLMAPI (${ctx.profile})`,
+          apiKeyEnv: 'FREELLMAPI_API_KEY',
+          api: 'openai-completions',
+          baseURL: v1Url(ctx.url),
+          models: entries,
         },
       },
+    },
+    // The default model is only claimed for the default profile; a
+    // named route is an extra option in the picker, not a takeover.
+    // A previous default's `reasoningEffort` must go with it: DSH
+    // refuses a request naming a level the selected model cannot
+    // take, and a hand-declared model declares none.
+    ...(ctx.profile === 'default'
+      ? {
+        'agent-default-model': {
+          provider: route,
+          model: model.id,
+          reasoningEffort: undefined,
+        },
+      }
+      : {}),
+  };
+  // Current DSH applies this home-level Cordis patch to every profile before
+  // its first request. Older releases read settings.yaml. Once DSH migrates
+  // that file, recreating it would re-import it over the user's next profile.
+  const legacy = path.join(home, 'settings.yaml');
+  const includeLegacy = existsSync(legacy) || !existsSync(legacy + '.imported');
+  return {
+    files: [
+      ...(includeLegacy ? [{ path: legacy, format: 'yaml' as const, value: settings }] : []),
       {
         path: path.join(home, '.env'),
         format: 'env',
         sensitive: true,
         content: `FREELLMAPI_API_KEY=${ctx.apiKey}\n`,
       },
+      { path: path.join(home, 'cordis.patch.yml'), format: 'yaml-entries', value: settings },
     ],
     notes: [
       `Start DeepSeek Harness with: npx @deepseek-ai/dsh web — ${route}/${model.id} is ${ctx.profile === 'default' ? 'the default model' : 'in the model picker'}.`,
-      'Settings are hot-reloaded, so a running dsh picks this up on its next request.',
+      'One-shot check: npx @deepseek-ai/dsh --profile headless "Say hello"',
+      'New sessions use the selected model. Restart a running profile if hot reload is disabled.',
       `Models are declared text-only; give a vision model \`input: [text, image]\` under ${route}.models in settings.yaml to send it images.`,
     ],
   };
@@ -571,6 +709,390 @@ function mimo(ctx: GenerateContext): Generation {
       'Install MiMo Code with: curl -fsSL https://mimo.xiaomi.com/install | bash',
       'Export FREELLMAPI_API_KEY before starting MiMo Code.',
       `Start it with \`mimo\` — freellmapi/${model.id} is the default model.`,
+      'One-shot check: mimo run "Say hello"',
+    ],
+  };
+}
+
+// OpenClaw reads one JSON5 document, $OPENCLAW_CONFIG_PATH (default
+// ~/.openclaw/openclaw.json, the state dir being relocatable through
+// OPENCLAW_STATE_DIR / OPENCLAW_HOME). Every model endpoint is an entry under
+// `models.providers`, and a provider its bundled catalog does not know must
+// spell out `baseUrl`, `api` and a non-empty `models` list — exactly what a
+// gateway with a per-user live catalog is. `api: openai-completions` is the
+// adapter for a /v1/chat/completions backend; OpenClaw already strips the
+// developer role and attribution headers for a custom origin, so no `compat`
+// switches are needed. The key travels as `${FREELLMAPI_API_KEY}`, OpenClaw's
+// own env substitution, and the value lands in $OPENCLAW_STATE_DIR/.env (0600),
+// the global env file OpenClaw loads on its own — so the route works with
+// nothing exported. The default model is `freellmapi/<id>` under
+// `agents.defaults.model.primary`; the patch keeps any `fallbacks` already
+// declared beside it.
+function openclawStateDir(homeDir: string): string {
+  return process.env.OPENCLAW_STATE_DIR?.trim()
+    || path.join(process.env.OPENCLAW_HOME?.trim() || homeDir, '.openclaw');
+}
+
+function openclaw(ctx: GenerateContext): Generation {
+  const model = primaryModel(ctx.models, ctx.requestedModelId);
+  const stateDir = openclawStateDir(ctx.homeDir);
+  const configPath = process.env.OPENCLAW_CONFIG_PATH?.trim()
+    || path.join(stateDir, 'openclaw.json');
+  // A provider id is referenced by every model ref (`<provider>/<model>`) and
+  // by session state, so it is permanent; a named profile becomes a second
+  // provider beside the default one rather than replacing it.
+  const provider = ctx.profile === 'default'
+    ? 'freellmapi'
+    : `freellmapi-${ctx.profile.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`;
+  const roster = catalogModels(ctx.models);
+  const entries = [model, ...roster.filter(entry => entry.id !== model.id)]
+    .map(entry => ({
+      id: entry.id,
+      name: entry.name ?? entry.id,
+      reasoning: false,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: contextWindow(entry),
+      maxTokens: outputLimit(entry),
+    }));
+  return {
+    files: [
+      {
+        path: configPath,
+        format: 'json',
+        value: {
+          ...(ctx.profile === 'default'
+            ? { agents: { defaults: { model: { primary: `${provider}/${model.id}` } } } }
+            : {}),
+          models: {
+            providers: {
+              [provider]: {
+                baseUrl: v1Url(ctx.url),
+                apiKey: '${FREELLMAPI_API_KEY}',
+                api: 'openai-completions',
+                // OpenClaw attaches its own `openclaw/<version>` identity only
+                // to endpoints it recognises; a custom origin gets the bare
+                // openai-node SDK user agent, which the gateway's analytics
+                // would file under "openai-sdk". A static provider header
+                // (verified to reach chat requests) names the client instead.
+                headers: { 'User-Agent': 'openclaw' },
+                models: entries,
+              },
+            },
+          },
+        },
+      },
+      {
+        path: path.join(stateDir, '.env'),
+        format: 'env',
+        sensitive: true,
+        content: `FREELLMAPI_API_KEY=${ctx.apiKey}\n`,
+      },
+    ],
+    notes: [
+      'Install OpenClaw with: npm install -g openclaw@latest --allow-scripts=openclaw',
+      `Try it without the gateway daemon: openclaw agent exec --model ${provider}/${model.id} "Say hello"`,
+      ctx.profile === 'default'
+        ? `${provider}/${model.id} is the default model; a running \`openclaw gateway\` needs a restart to pick the change up.`
+        : `${provider}/${model.id} is in the model picker; the default model is unchanged.`,
+      `Models are declared text-only; give a vision model \`input: ["text", "image"]\` under models.providers.${provider} to send it images.`,
+    ],
+  };
+}
+
+// Hermes Agent (Nous Research) reads one YAML document, $HERMES_HOME/config.yaml
+// (default ~/.hermes), and treats it as the single source of truth for the
+// endpoint: OPENAI_BASE_URL is deliberately ignored for anything but
+// api.openai.com, and OPENAI_API_KEY is only sent to OpenAI hosts. So the
+// gateway goes into the `model` block as `provider: custom` with `base_url`,
+// and the key travels as `api_key: "${FREELLMAPI_API_KEY}"` — Hermes's own
+// substitution — with the value in $HERMES_HOME/.env (0600), the file Hermes
+// loads on its own, so nothing needs exporting. A fresh install ships
+// `model: ""` (a "not configured" sentinel); replacing it with the mapping is
+// exactly what `hermes setup` would do, and it is what lets a headless first
+// run skip the wizard. A named profile becomes an entry in the `providers`
+// dict instead — picked with `/model custom:<name>:<model>` — leaving the
+// default model alone.
+function hermes(ctx: GenerateContext): Generation {
+  const model = primaryModel(ctx.models, ctx.requestedModelId);
+  const home = process.env.HERMES_HOME?.trim() || (process.platform === 'win32'
+    ? path.join(process.env.LOCALAPPDATA || path.join(ctx.homeDir, 'AppData', 'Local'), 'hermes')
+    : path.join(ctx.homeDir, '.hermes'));
+  const provider = `freellmapi-${ctx.profile.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`;
+  // Hermes only identifies itself to hosts it knows; a custom endpoint gets the
+  // bare openai-python user agent. `default_headers` is its documented way to
+  // override that, and it is what lets the gateway's analytics name the client.
+  const headers = { 'User-Agent': 'hermes-agent' };
+  const value: Record<string, unknown> = ctx.profile === 'default'
+    ? {
+      model: {
+        provider: 'custom',
+        default: model.id,
+        base_url: v1Url(ctx.url),
+        api_key: '${FREELLMAPI_API_KEY}',
+        api_mode: 'chat_completions',
+        context_length: contextWindow(model),
+        default_headers: headers,
+        // The wizard strips these when it writes api_key; a leftover would
+        // point the key lookup at a variable this route never sets.
+        key_env: undefined,
+        api_key_env: undefined,
+      },
+    }
+    : {
+      providers: {
+        [provider]: {
+          name: `FreeLLMAPI (${ctx.profile})`,
+          api: v1Url(ctx.url),
+          api_key: '${FREELLMAPI_API_KEY}',
+          transport: 'chat_completions',
+          default_model: model.id,
+          context_length: contextWindow(model),
+          extra_headers: headers,
+        },
+      },
+    };
+  return {
+    files: [
+      { path: path.join(home, 'config.yaml'), format: 'yaml', value },
+      {
+        path: path.join(home, '.env'),
+        format: 'env',
+        sensitive: true,
+        content: `FREELLMAPI_API_KEY=${ctx.apiKey}\n`,
+      },
+    ],
+    notes: [
+      'Install Hermes Agent with: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup',
+      ctx.profile === 'default'
+        ? `Try it with: hermes -z "Say hello" — custom/${model.id} is the default model.`
+        : `Pick it inside a chat with: /model custom:${provider}:${model.id} — the default model is unchanged.`,
+      'A running `hermes gateway` (Telegram, Discord, …) needs a restart to pick the change up.',
+    ],
+  };
+}
+
+// Pi (pi.dev, @earendil-works/pi-coding-agent) keeps user configuration in its
+// agent directory, $PI_CODING_AGENT_DIR (default ~/.pi/agent). An endpoint Pi
+// does not ship is a provider entry in models.json — `baseUrl`, `api` and the
+// `models` it serves — and `api: openai-completions` is the adapter for a
+// /v1/chat/completions backend. Pi does not load a .env file of its own, so the
+// key is written literally (the file is created 0600); its `$NAME` form would
+// need the variable exported in every shell that starts Pi. A provider entry
+// alone only adds models to `/model`: the startup choice is `defaultProvider`
+// plus `defaultModel` in settings.json, which a named profile leaves alone.
+function piAgentDir(homeDir: string): string {
+  return process.env.PI_CODING_AGENT_DIR?.trim() || path.join(homeDir, '.pi', 'agent');
+}
+
+function pi(ctx: GenerateContext): Generation {
+  const model = primaryModel(ctx.models, ctx.requestedModelId);
+  const dir = piAgentDir(ctx.homeDir);
+  const provider = ctx.profile === 'default'
+    ? 'freellmapi'
+    : `freellmapi-${ctx.profile.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`;
+  const roster = catalogModels(ctx.models);
+  const entries = [model, ...roster.filter(entry => entry.id !== model.id)]
+    .map(entry => ({
+      id: entry.id,
+      name: entry.name ?? entry.id,
+      // The gateway picks the upstream per request, so no model can promise a
+      // thinking API; Pi then sends no reasoning effort at all.
+      reasoning: false,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: contextWindow(entry),
+      maxTokens: outputLimit(entry),
+    }));
+  const files: Generation['files'] = [{
+    path: path.join(dir, 'models.json'),
+    format: 'json',
+    sensitive: true,
+    value: {
+      providers: {
+        [provider]: {
+          name: ctx.profile === 'default' ? 'FreeLLMAPI' : `FreeLLMAPI (${ctx.profile})`,
+          baseUrl: v1Url(ctx.url),
+          api: 'openai-completions',
+          apiKey: ctx.apiKey,
+          // Pi names itself only to a few hosts it knows; a custom endpoint gets
+          // the bare openai-node SDK user agent, which the gateway's analytics
+          // would file under "openai-sdk". This is the UA Pi already sends to
+          // Cloudflare, so analytics can name the client.
+          headers: { 'User-Agent': 'pi-coding-agent' },
+          models: entries,
+        },
+      },
+    },
+  }];
+  if (ctx.profile === 'default') {
+    files.push({
+      path: path.join(dir, 'settings.json'),
+      format: 'json',
+      value: { defaultProvider: provider, defaultModel: model.id },
+    });
+  }
+  return {
+    files,
+    notes: [
+      'Install Pi with: npm install -g @earendil-works/pi-coding-agent (or curl -fsSL https://pi.dev/install.sh | sh)',
+      ctx.profile === 'default'
+        ? `Try it with: pi -p "Say hello" — ${provider}/${model.id} is the default model.`
+        : `Try it with: pi --model ${provider}/${model.id} -p "Say hello" — the default model is unchanged.`,
+      'Every catalog model is in /model; a running Pi session picks the change up when /model is opened.',
+      `Models are declared text-only; give a vision model \`input: ["text", "image"]\` under providers.${provider} in models.json to send it images.`,
+    ],
+  };
+}
+
+// Reasonix (reasonix.io, esengine/DeepSeek-Reasonix) reads one global TOML
+// document, <Reasonix home>/config.toml — ~/.reasonix, %APPDATA%\reasonix on
+// Windows, or $REASONIX_HOME when set. Every endpoint is a `[[providers]]`
+// entry; `kind = "openai"` posts to `<base_url>/chat/completions`, and a
+// `models` list exposes the whole catalog under one connection. The entry only
+// names its key variable (`api_key_env`); Reasonix keeps the value in the .env
+// beside config.toml (0600) and reads it on its own, so nothing needs
+// exporting. `default_model` is `provider/model`. Reasonix already sends
+// `User-Agent: Reasonix/<version>` to every endpoint, so no header is needed.
+function reasonixHome(homeDir: string): string {
+  if (process.env.REASONIX_HOME?.trim()) return process.env.REASONIX_HOME.trim();
+  if (process.platform === 'win32') {
+    return path.join(process.env.APPDATA?.trim() || path.join(homeDir, 'AppData', 'Roaming'), 'reasonix');
+  }
+  return path.join(homeDir, '.reasonix');
+}
+
+function reasonix(ctx: GenerateContext): Generation {
+  const model = primaryModel(ctx.models, ctx.requestedModelId);
+  const home = reasonixHome(ctx.homeDir);
+  // A provider name is what every `provider/model` ref and saved session points
+  // at, so a named profile becomes a second entry rather than replacing it.
+  const provider = ctx.profile === 'default'
+    ? 'freellmapi'
+    : `freellmapi-${ctx.profile.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`;
+  const roster = catalogModels(ctx.models);
+  const models = [model, ...roster.filter(entry => entry.id !== model.id)].map(entry => entry.id);
+  return {
+    files: [
+      {
+        path: path.join(home, 'config.toml'),
+        format: 'toml',
+        content: [
+          ...(ctx.profile === 'default' ? [`default_model = ${JSON.stringify(`${provider}/${model.id}`)}`, ''] : []),
+          '[[providers]]',
+          `name = ${JSON.stringify(provider)}`,
+          `display_name = ${JSON.stringify(ctx.profile === 'default' ? 'FreeLLMAPI' : `FreeLLMAPI (${ctx.profile})`)}`,
+          'kind = "openai"',
+          `base_url = ${JSON.stringify(v1Url(ctx.url))}`,
+          `models = [${models.map(id => JSON.stringify(id)).join(', ')}]`,
+          `default = ${JSON.stringify(model.id)}`,
+          'api_key_env = "FREELLMAPI_API_KEY"',
+          `context_window = ${contextWindow(model)}`,
+          // Without a price Reasonix bills unknown models at a guessed rate;
+          // the gateway's models are free.
+          'price = { cache_hit = 0, input = 0, output = 0, currency = "$" }',
+        ].join('\n'),
+      },
+      {
+        path: path.join(home, '.env'),
+        format: 'env',
+        sensitive: true,
+        content: `FREELLMAPI_API_KEY=${ctx.apiKey}\n`,
+      },
+    ],
+    notes: [
+      'Install Reasonix with: npm install -g reasonix (or brew install esengine/reasonix/reasonix)',
+      ctx.profile === 'default'
+        ? `Try it with: reasonix -p "Say hello" — ${provider}/${model.id} is the default model.`
+        : `Try it with: reasonix --model ${provider}/${model.id} -p "Say hello" — the default model is unchanged.`,
+      `Every catalog model is in /model as ${provider}/<id>; other [[providers]] entries in config.toml are kept.`,
+      `Reasonix Studio lists only the providers in [desktop].provider_access when that list is set; add "${provider}" there, or under Settings → Model → Access.`,
+    ],
+  };
+}
+
+// ZCode (zcode.z.ai, Z.ai's coding agent). The Desktop app and the CLI share
+// one provider registry, ~/.zcode/v2/provider_config.json (underscore), which
+// ZCODE_PERSONAL_PROVIDER_CONFIG_FILE can relocate. A custom provider is an
+// entry in config.providerConfigRules.providerRules with an `api-key` access
+// block and an `openai-chat-completions` endpoint; each model gets a "smart"
+// rule in modelConfigRules.providerModelRules that pins only its context and
+// output limits. Those are arrays, so the merge replaces only the entries this
+// provider owns and keeps every other provider and rule. ZCode has no
+// environment-variable lookup for a custom provider's key, so the key lives in
+// the file, which the writer keeps at 0600. Live checked against the ZCode
+// runtime 0.16.9 (zcode-app-cli 3.15.3): ~/.zcode/v2/config.json and
+// ~/.zcode/cli/config.json are legacy files it reads once, for migration.
+function zcodeProviderFile(homeDir: string): string {
+  const override = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE?.trim();
+  if (override && path.isAbsolute(override)) return override;
+  return path.join(homeDir, '.zcode', 'v2', 'provider_config.json');
+}
+
+function zcode(ctx: GenerateContext): Generation {
+  const model = primaryModel(ctx.models, ctx.requestedModelId);
+  // Like every other generator, a named profile is a second provider entry so
+  // both routes coexist in ZCode's model picker.
+  const provider = ctx.profile === 'default'
+    ? 'freellmapi'
+    : `freellmapi-${ctx.profile.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`;
+  const ids = [model, ...catalogModels(ctx.models).filter(entry => entry.id !== model.id)];
+  return {
+    files: [{
+      path: zcodeProviderFile(ctx.homeDir),
+      format: 'json',
+      sensitive: true,
+      arrays: {
+        'config.providerConfigRules.providerRules': { ownedBy: { providerId: provider } },
+        'config.modelConfigRules.providerModelRules': { ownedBy: { providerId: provider } },
+        'config.modelConfigRules.manualProviderModelRules': { ownedBy: { providerId: provider } },
+        'config.providerOrder': { union: true },
+      },
+      value: {
+        schemaVersion: 1,
+        config: {
+          providerConfigRules: {
+            providerRules: [{
+              providerId: provider,
+              templateId: null,
+              providerName: ctx.profile === 'default' ? 'FreeLLMAPI' : `FreeLLMAPI (${ctx.profile})`,
+              enabled: true,
+              config: {
+                group: 'standard-personal',
+                access: { type: 'api-key', apiKey: ctx.apiKey },
+                api: { type: 'openai-chat-completions', baseUrl: v1Url(ctx.url) },
+                personalModelIds: ids.map(entry => entry.id),
+                modelOrder: ids.map(entry => entry.id),
+                visibility: 'visible',
+              },
+            }],
+          },
+          modelConfigRules: {
+            providerModelRules: ids.map(entry => ({
+              providerId: provider,
+              modelId: entry.id,
+              config: {
+                enabled: true,
+                properties: { contextWindow: contextWindow(entry) },
+                optionSpecs: {
+                  maxOutputTokens: { max: outputLimit(entry), map: '{"max_tokens": maxOutputTokens}' },
+                },
+              },
+            })),
+            // Present but empty: ZCode expects both rule arrays, and the merge
+            // drops any manual rule this provider had so a model never sits in both.
+            manualProviderModelRules: [],
+          },
+          providerOrder: [provider],
+          defaultModelSelection: { providerId: provider, modelId: model.id },
+        },
+      },
+    }],
+    notes: [
+      'Install ZCode from https://zcode.z.ai (or the community terminal client: npm i -g zcode-app-cli).',
+      'Quit ZCode Desktop before running this so it does not save its in-memory registry over the file.',
+      `${provider}/${model.id} is now the default model; pick another under ${provider} in the model picker (or /model in the CLI). Other providers are kept.`,
+      'The API key lives in the provider file (written 0600): ZCode has no env lookup for custom providers.',
     ],
   };
 }
@@ -591,30 +1113,32 @@ function cursor(_ctx: GenerateContext): Generation {
 function atomcode(ctx: GenerateContext): Generation {
   const model = primaryModel(ctx.models, ctx.requestedModelId);
   const configDir = path.join(ctx.homeDir, '.atomcode');
-  // AtomCode picks its provider by name: a root `default_provider` key names
-  // one `[providers.<id>]` table, and `type = "openai"` is what makes that
-  // table speak the OpenAI-compatible wire. Root key first, table second, so
-  // mergeToml can slot the key above any tables already in the file.
+  // default_model takes precedence over legacy default_provider settings.
+  // Keep the selector above tables so mergeToml writes it at the root.
   return {
     files: [{
       path: path.join(configDir, 'config.toml'),
       format: 'toml',
       sensitive: true,
       content: [
-        'default_provider = "freellmapi"',
+        'default_model = "freellmapi"',
         '',
-        '[providers.freellmapi]',
-        'type = "openai"',
+        '[provider_accounts.freellmapi]',
+        'provider = "openai"',
         `base_url = ${JSON.stringify(v1Url(ctx.url))}`,
         `api_key = ${JSON.stringify(ctx.apiKey)}`,
+        '',
+        '[models.freellmapi]',
+        'account = "freellmapi"',
         `model = ${JSON.stringify(model.id)}`,
         `context_window = ${contextWindow(model)}`,
       ].join('\n'),
     }],
     notes: [
-      'AtomCode reads ~/.atomcode/config.toml; other [providers.*] tables in it are kept.',
-      `default_provider now points at [providers.freellmapi] with ${model.id} as its model.`,
+      'AtomCode reads ~/.atomcode/config.toml; unrelated accounts, models and legacy providers are kept.',
+      `default_model now points at [models.freellmapi] with ${model.id} via [provider_accounts.freellmapi].`,
       'Point base_url at the unified /v1 endpoint; api_key is the unified key shown on the Agents page.',
+      'One-shot check: atomcode -p "Say hello" (telemetry is on by default: atomcode telemetry disable).',
     ],
   };
 }
@@ -647,6 +1171,11 @@ const metadata = [
   ['dsh', 'DeepSeek Harness', 'agent', 'file', 'OpenAI Chat', '/v1', 'setup-dsh', 'https://github.com/deepseek-ai/deepseek-harness', dsh],
   ['mimo', 'MiMo Code', 'code', 'file', 'OpenAI Chat', '/v1', 'setup-mimo', 'https://mimo.xiaomi.com/mimocode', mimo],
   ['atomcode', 'AtomCode', 'code', 'file', 'OpenAI Chat', '/v1', 'setup-atomcode', 'https://atomcode.atomgit.com/docs/en/', atomcode],
+  ['openclaw', 'OpenClaw', 'agent', 'file', 'OpenAI Chat', '/v1', 'setup-openclaw', 'https://docs.openclaw.ai/gateway/config-tools/custom-providers', openclaw],
+  ['hermes', 'Hermes Agent', 'agent', 'file', 'OpenAI Chat', '/v1', 'setup-hermes', 'https://hermes-agent.nousresearch.com/docs/', hermes],
+  ['pi', 'Pi', 'code', 'file', 'OpenAI Chat', '/v1', 'setup-pi', 'https://pi.dev/docs/latest/models', pi],
+  ['reasonix', 'Reasonix', 'code', 'file', 'OpenAI Chat', '/v1', 'setup-reasonix', 'https://github.com/esengine/DeepSeek-Reasonix/blob/studio/docs/CLI.md#configure-providers', reasonix],
+  ['zcode', 'ZCode', 'code', 'file', 'OpenAI Chat', '/v1', 'setup-zcode', 'https://zcode.z.ai/en/docs/configuration', zcode],
   ['cursor', 'Cursor', 'code', 'guide', 'OpenAI Chat', '/v1', 'setup-cursor', 'https://docs.cursor.com', cursor],
   ['generic', 'Generic OpenAI client', 'agent', 'guide', 'OpenAI Chat', '/v1', 'setup-generic', 'https://github.com/tashfeenahmed/freellmapi', generic],
 ] as const;

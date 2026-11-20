@@ -4,9 +4,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RETENTION_DAYS = 90;
 const DEFAULT_MAX_ROWS = 100_000;
 const PRUNE_INTERVAL_MS = 60_000;
-// Hourly aggregate table. Pruned once a day on the same 60s tick; bounded at
-// ~720 rows for a 30d max UI range. See db/migrations/.../request_aggregates.ts.
-const HOURLY_RETENTION_DAYS = 30;
+// Hourly aggregate table. Pruned once a day on the same 60s tick, using the
+// SAME age bound as the raw `requests` table (REQUEST_ANALYTICS_RETENTION_DAYS):
+// the aggregate is the source of truth for the windowed totals, so pruning it
+// sooner than the rows it summarizes silently shrinks the widest UI range. A
+// hardcoded 30d did exactly that once the dashboard grew a 90d tab (and now an
+// "all" range). The table is tiny either way (~2.2k rows for 90d).
 const HOURLY_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Persisted server_logs (warn/error only — see the migration). Much shorter
 // than the 90d analytics window: a week is well past the point where anyone is
@@ -19,8 +22,22 @@ const DEFAULT_SERVER_LOGS_MAX_ROWS = 50_000;
 // further back than the newest row per pool, so the history is diagnostics
 // only — yet a busy install wrote ~15k rows a day and reached 470k rows in a
 // month. Pruned on the daily gate: the delete is a range over created_at.
-const DEFAULT_QUOTA_OBSERVATIONS_RETENTION_DAYS = 30;
-const DEFAULT_QUOTA_OBSERVATIONS_MAX_ROWS = 200_000;
+// A week / 50k rows (#1675): 200k rows with raw_json was ~130 MB of history
+// nobody reads, and the cap is still far above the live pool count.
+const DEFAULT_QUOTA_OBSERVATIONS_RETENTION_DAYS = 7;
+const DEFAULT_QUOTA_OBSERVATIONS_MAX_ROWS = 50_000;
+// search_requests (#1174) is the per-attempt web-search log behind the Search
+// dashboard. Before this it was the one log with no bound at all: every agent
+// web_search (up to 20 per request) appended a row forever. The widest UI
+// window is 90d, so the default age bound matches the `requests` table.
+const DEFAULT_SEARCH_RETENTION_DAYS = 90;
+const DEFAULT_SEARCH_MAX_ROWS = 100_000;
+// decision_requests (#1537) is the per-attempt decision-model log behind the
+// Models → Decision page. Same shape as search_requests: an append-only
+// attempt log whose only reader is a month-scoped count, so older rows are
+// pure disk growth. Bounded like the search log.
+const DEFAULT_DECISION_RETENTION_DAYS = 90;
+const DEFAULT_DECISION_MAX_ROWS = 100_000;
 
 type RetentionDb = ReturnType<typeof getDb>;
 
@@ -77,6 +94,32 @@ export function getQuotaObservationRetentionConfig(): QuotaObservationRetentionC
   return {
     retentionDays: readNonNegativeInt('QUOTA_OBSERVATIONS_RETENTION_DAYS', DEFAULT_QUOTA_OBSERVATIONS_RETENTION_DAYS),
     maxRows: readNonNegativeInt('QUOTA_OBSERVATIONS_MAX_ROWS', DEFAULT_QUOTA_OBSERVATIONS_MAX_ROWS),
+  };
+}
+
+export interface SearchLogRetentionConfig {
+  retentionDays: number;
+  maxRows: number;
+}
+
+/** Same env convention as the pairs above; 0 on either knob disables that half. */
+export function getSearchLogRetentionConfig(): SearchLogRetentionConfig {
+  return {
+    retentionDays: readNonNegativeInt('SEARCH_LOGS_RETENTION_DAYS', DEFAULT_SEARCH_RETENTION_DAYS),
+    maxRows: readNonNegativeInt('SEARCH_LOGS_MAX_ROWS', DEFAULT_SEARCH_MAX_ROWS),
+  };
+}
+
+export interface DecisionLogRetentionConfig {
+  retentionDays: number;
+  maxRows: number;
+}
+
+/** Same env convention as the pairs above; 0 on either knob disables that half. */
+export function getDecisionLogRetentionConfig(): DecisionLogRetentionConfig {
+  return {
+    retentionDays: readNonNegativeInt('DECISION_LOGS_RETENTION_DAYS', DEFAULT_DECISION_RETENTION_DAYS),
+    maxRows: readNonNegativeInt('DECISION_LOGS_MAX_ROWS', DEFAULT_DECISION_MAX_ROWS),
   };
 }
 
@@ -199,6 +242,119 @@ export function pruneServerLogs(db: RetentionDb, nowMs: number): number {
   return deleted;
 }
 
+/**
+ * Sweep expired rows from the short-lived replay stores and the session table.
+ *
+ * idempotency_claims and response_cache are write-once with a TTL that readers
+ * already filter on (`expires_at_ms > now`), and both are indexed on
+ * `expires_at_ms`. Neither had a sweeper: `storeIdempotencyResult` only deletes
+ * expired rows for the SAME key hash it is about to overwrite, so a claim
+ * whose hash never repeats — the common case, since clients send a fresh UUID
+ * per request — sat in the DB forever with its full response JSON. A busy
+ * install replaying Idempotency-Key traffic grew this table monotonically.
+ * `response_cache` swept expired rows only at startup, so a long-running
+ * server accumulated them between restarts too.
+ *
+ * `sessions` joins the sweep for the same reason (#1510-era retention series):
+ * validateSession only deletes a row when its OWN token is checked again — and
+ * an expired token is by definition never re-sent — while login mints a new
+ * row per sign-in (30-day TTL). Desktop installs that mint a session on every
+ * dashboard load leak one row per load. Expired rows are dead weight for every
+ * reader (validateSession filters on expires_at_ms), so deleting them is safe.
+ * sessions has no index on expires_at_ms; the delete is a scan of a table that
+ * is at most a few hundred rows on any install, once per prune gate.
+ *
+ * The claims/cache deletes are plain index-range walks over `expires_at_ms`,
+ * so cost scales with what is actually expired. Guarded against the tables
+ * being absent the same way every other prune here is.
+ */
+export function pruneExpiredClaims(db: RetentionDb, nowMs: number): number {
+  let deleted = 0;
+  for (const table of ['idempotency_claims', 'response_cache', 'sessions'] as const) {
+    const present = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
+      .get(table);
+    if (!present) continue;
+    deleted += db.prepare(`DELETE FROM ${table} WHERE expires_at_ms <= ?`).run(nowMs).changes;
+  }
+  return deleted;
+}
+
+/**
+ * Age- and count-bound the web-search attempt log (#1174).
+ *
+ * Folded into the same 60s pass as the server logs. search_requests grew on
+ * every agent web_search attempt with no prune of any kind; its analytics only
+ * answer windows up to 90d ('all' included), so older rows are pure disk
+ * growth. Guarded against the table being absent like every other prune here.
+ */
+export function pruneSearchLogs(db: RetentionDb, nowMs: number): number {
+  const hasTable = !!db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='search_requests'")
+    .get();
+  if (!hasTable) return 0;
+
+  const { retentionDays, maxRows } = getSearchLogRetentionConfig();
+  let deleted = 0;
+
+  if (retentionDays > 0) {
+    const cutoff = toSqliteTimestamp(new Date(nowMs - retentionDays * DAY_MS));
+    deleted += db.prepare('DELETE FROM search_requests WHERE created_at < ?').run(cutoff).changes;
+  }
+
+  if (maxRows > 0) {
+    deleted += db.prepare(`
+      DELETE FROM search_requests
+      WHERE id IN (
+        SELECT id
+        FROM search_requests
+        ORDER BY created_at DESC, id DESC
+        LIMIT -1 OFFSET ?
+      )
+    `).run(maxRows).changes;
+  }
+
+  return deleted;
+}
+
+/**
+ * Age- and count-bound the decision-model attempt log (#1537).
+ *
+ * decision_requests grew on every POST /v1/decisions attempt (and every failed
+ * one — a cooling-down key still logs) with no prune of any kind. Its only
+ * reader is the month-scoped count on the Decision page, so the 90d default
+ * matches the other attempt logs. Guarded against the table being absent like
+ * every other prune here.
+ */
+export function pruneDecisionLogs(db: RetentionDb, nowMs: number): number {
+  const hasTable = !!db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='decision_requests'")
+    .get();
+  if (!hasTable) return 0;
+
+  const { retentionDays, maxRows } = getDecisionLogRetentionConfig();
+  let deleted = 0;
+
+  if (retentionDays > 0) {
+    const cutoff = toSqliteTimestamp(new Date(nowMs - retentionDays * DAY_MS));
+    deleted += db.prepare('DELETE FROM decision_requests WHERE created_at < ?').run(cutoff).changes;
+  }
+
+  if (maxRows > 0) {
+    deleted += db.prepare(`
+      DELETE FROM decision_requests
+      WHERE id IN (
+        SELECT id
+        FROM decision_requests
+        ORDER BY created_at DESC, id DESC
+        LIMIT -1 OFFSET ?
+      )
+    `).run(maxRows).changes;
+  }
+
+  return deleted;
+}
+
 export function pruneRequestAnalytics(options: {
   db?: RetentionDb;
   force?: boolean;
@@ -236,10 +392,19 @@ export function pruneRequestAnalytics(options: {
   // Persisted server logs, on the same 60s gate as the requests prune above.
   deleted += pruneServerLogs(db, nowMs);
 
-  // Hourly aggregate prune (gated once per day). The UI's widest window is
-  // 30d, so we keep at most 30 days of hourly buckets (~720 rows). The table
-  // is the source of truth for analytics totals — never prune more aggressively
-  // than the UI range, or the 30d count will silently drop again.
+  // Expired idempotency claims, cache rows and dashboard sessions, on the
+  // same 60s gate. All are TTL'd stores with no reader past expiry and no
+  // other sweeper.
+  deleted += pruneExpiredClaims(db, nowMs);
+  // Web-search attempt log, same gate (see pruneSearchLogs).
+  deleted += pruneSearchLogs(db, nowMs);
+  // Decision-model attempt log, same gate (see pruneDecisionLogs).
+  deleted += pruneDecisionLogs(db, nowMs);
+
+  // Hourly aggregate prune (gated once per day). It shares the raw table's age
+  // bound so the windowed totals never lose days the raw rows still cover — the
+  // aggregate is the source of truth for /summary and /timeline, and pruning it
+  // more aggressively than the UI range silently drops that range's history.
   // Guarded against the table being absent (tests that init a DB before the
   // migration runs would otherwise crash the prune loop).
   // Quota observation log, once a day — or again next tick while a large
@@ -255,12 +420,14 @@ export function pruneRequestAnalytics(options: {
     const hasHourly = !!db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='request_hourly'")
       .get();
-    if (hasHourly) {
+    // retentionDays === 0 disables the age bound for the raw table too, so the
+    // aggregate keeps everything and only the (missing) count bound would apply.
+    if (hasHourly && retentionDays > 0) {
       // Hour keys are created_at truncated to the hour, in SQLite's canonical
       // 'YYYY-MM-DD HH:00:00' text (space separator) — same as logRequest.hourKey()
       // and the summary/timeline readers. Floor the cutoff to the hour and
       // compare on the space form so the prune boundary matches the read window.
-      const sqliteCutoff = toSqliteTimestamp(new Date(nowMs - HOURLY_RETENTION_DAYS * DAY_MS));
+      const sqliteCutoff = toSqliteTimestamp(new Date(nowMs - retentionDays * DAY_MS));
       const hourlyCutoff = sqliteCutoff.slice(0, 13) + ':00:00';
       const hourlyDeleted = db.prepare('DELETE FROM request_hourly WHERE hour < ?').run(hourlyCutoff).changes;
       if (hourlyDeleted > 0) {

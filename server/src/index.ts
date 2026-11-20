@@ -6,7 +6,9 @@ import { restoreProxySettings, flushProxyCache } from './lib/proxy.js';
 import { startWakeDetect } from './lib/wake-detect.js';
 import { startCatalogSync } from './services/catalog-sync.js';
 import { startCooldownProbe } from './services/cooldown-probe.js';
+import { startModelProbe } from './services/model-probe.js';
 import { startCustomModelSync } from './services/custom-model-sync.js';
+import { startBuiltinModelDiscovery } from './services/builtin-model-discovery.js';
 import { installProcessSafetyNet } from './lib/process-safety-net.js';
 import { NodeScheduler } from './lib/scheduler.js';
 import { loadConfig } from './lib/config.js';
@@ -20,6 +22,7 @@ import { warnOnRoutingOverrideDrift } from './services/model-weight-overrides.js
 import { installLogRedaction } from './lib/log-redaction.js';
 import { cleanupExpiredCooldowns } from './services/ratelimit.js';
 import { loadCacheFromDb } from './services/cache.js';
+import { installGracefulShutdown } from './lib/graceful-shutdown.js';
 
 // Before any other statement runs, so no provider key can reach stdout — users
 // paste server output into bug reports. Module scope, not inside main(), so it
@@ -82,9 +85,11 @@ async function main() {
     startHealthChecker(scheduler);
     startCatalogSync(scheduler);
     startCooldownProbe(scheduler);
+    startModelProbe(scheduler);
     startDbBackupPump(getDb(), scheduler, config.dbPath ?? undefined);
     startBackupScheduler(scheduler);
     startCustomModelSync(getDb(), scheduler);
+    startBuiltinModelDiscovery(getDb(), scheduler);
 
     // Post-sleep recovery: while the host was suspended (laptop lid, VM
     // pause) timers and keep-alive sockets froze, so the first requests after
@@ -122,6 +127,8 @@ async function main() {
 
   const server = app.listen(Number(PORT), HOST, onReady(HOST));
   tuneKeepAlive(server);
+  const servers = [server];
+  installGracefulShutdown({ servers: () => servers.filter(s => s.listening), closeDb: () => getDb().close?.() });
   server.on('error', (err: NodeJS.ErrnoException) => {
     // The default '::' bind fails where IPv6 is disabled (kernel
     // ipv6.disable=1 and the like) — retry IPv4-only rather than dying.
@@ -129,7 +136,9 @@ async function main() {
     // fail-fast posture documented in main().catch below.
     if (!process.env.HOST && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL')) {
       console.warn('[server] IPv6 unavailable on this host — falling back to 0.0.0.0 (IPv4-only)');
-      tuneKeepAlive(app.listen(Number(PORT), '0.0.0.0', onReady('0.0.0.0')));
+      const fallback = app.listen(Number(PORT), '0.0.0.0', onReady('0.0.0.0'));
+      tuneKeepAlive(fallback);
+      servers.push(fallback);
       return;
     }
     console.error('\n[server] Failed to start:\n  ' + (err?.message ?? err) + '\n');

@@ -10,11 +10,31 @@ import type { Scheduler } from '../lib/scheduler.js';
 const SCHEDULE_SETTING = 'backup_schedule';
 const LAST_RUN_SETTING = 'backup_last_run_day';
 
+// #1675: the automatic dump sources — the background scheduler and the
+// desktop updater's pre-update snapshot — write a full dump each time they
+// fire and nothing ever removed one. A single-user desktop install that
+// updated a few times a month accumulated 60-70 MB per update indefinitely.
+// Manual dumps are the operator's own intent and pre-restore snapshots are
+// the only undo for a restore, so neither is ever auto-deleted; only the two
+// sources the software creates by itself are bounded, by count. `0` disables
+// the prune (the "documented opt-out" the issue asks for).
+const DEFAULT_AUTO_DUMP_RETENTION = 10;
+export const AUTO_DUMP_SOURCES: ReadonlySet<string> = new Set(['scheduled', 'pre-update']);
+
+export function getAutoDumpRetention(): number {
+  const raw = process.env.AUTO_BACKUP_DUMP_RETENTION;
+  if (raw === undefined || raw.trim() === '') return DEFAULT_AUTO_DUMP_RETENTION;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) return DEFAULT_AUTO_DUMP_RETENTION;
+  return parsed;
+}
+
 /** Bumped whenever the on-disk dump layout changes in a way an older restore
  *  path would misread. Restore refuses anything it does not know. */
 const DUMP_FORMAT = 1;
 
-export type BackupSource = 'manual' | 'scheduled' | 'pre-restore';
+export const BACKUP_SOURCES = ['manual', 'scheduled', 'pre-restore', 'pre-update'] as const;
+export type BackupSource = (typeof BACKUP_SOURCES)[number];
 
 export interface BackupSchedule {
   enabled: boolean;
@@ -289,7 +309,7 @@ export function createBackup(
   const now = new Date();
   const createdAt = now.toISOString();
   const stamp = now.toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '-');
-  const prefix = source === 'scheduled' ? 'auto-backup' : source === 'pre-restore' ? 'pre-restore' : 'backup';
+  const prefix = source === 'scheduled' ? 'auto-backup' : source === 'manual' ? 'backup' : source;
   const filename = `${prefix}-${stamp}-${crypto.randomBytes(3).toString('hex')}.sql`;
 
   const dir = resolveBackupDir(db, opts.backupPath ?? readBackupSchedule().backupPath);
@@ -303,7 +323,58 @@ export function createBackup(
     'INSERT INTO backups (filename, filepath, filesize, is_full, source, created_at, tables_json) VALUES (?, ?, ?, ?, ?, ?, ?)',
   ).run(filename, filepath, filesize, isFull ? 1 : 0, source, createdAt, JSON.stringify(tables));
 
+  // #1675: writing a dump is the one moment we know the auto-dump pile needs
+  // re-checking. Runs after the insert so the fresh row counts toward the
+  // bound, and never fails the backup that just succeeded.
+  try {
+    pruneAutoDumps(db);
+  } catch (err) {
+    console.error('[backups] auto-dump retention sweep failed:', err);
+  }
+
   return { id: Number(result.lastInsertRowid), filename, filesize, isFull, source, createdAt, tables };
+}
+
+/**
+ * Bound the pile of automatic dumps (#1675).
+ *
+ * The scheduler and the desktop updater append a full dump each and nothing
+ * removed them, so disk usage grew forever (the reporter's `backups/` held
+ * 60-70 MB per app update). Keeps the newest `AUTO_BACKUP_DUMP_RETENTION`
+ * auto dumps per source-agnostic count; `0` keeps every dump (opt-out).
+ * Manual and pre-restore dumps are never touched: one is operator intent,
+ * the other is the only undo for a restore.
+ *
+ * Deleting the row reuses deleteBackup's path re-check (a stale or hand-edited
+ * row may point outside the data directory; that dump is left alone rather
+ * than unlinking an arbitrary file) — so a dump whose file is already gone
+ * still loses its index row, which is the half that mattered for the listing.
+ */
+export function pruneAutoDumps(db: Db, keep = getAutoDumpRetention()): number {
+  if (keep <= 0) return 0;
+  const stale = db.prepare(`
+    SELECT id FROM backups
+    WHERE source IN (${[...AUTO_DUMP_SOURCES].map(() => '?').join(', ')})
+      AND id NOT IN (
+        SELECT id FROM backups
+        WHERE source IN (${[...AUTO_DUMP_SOURCES].map(() => '?').join(', ')})
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+      )
+    ORDER BY id ASC
+  `).all(...AUTO_DUMP_SOURCES, ...AUTO_DUMP_SOURCES, keep) as { id: number }[];
+
+  let deleted = 0;
+  for (const row of stale) {
+    try {
+      deleteBackup(db, row.id);
+      deleted += 1;
+    } catch {
+      // Path outside the data directory (or row vanished mid-sweep): not ours
+      // to delete; the next sweep tries again, same as today's behaviour.
+    }
+  }
+  return deleted;
 }
 
 /* ------------------------------------------------------------------ */
@@ -331,8 +402,9 @@ function toMeta(row: BackupRow): BackupMeta {
   } catch {
     tables = [];
   }
-  const source: BackupSource =
-    row.source === 'scheduled' ? 'scheduled' : row.source === 'pre-restore' ? 'pre-restore' : 'manual';
+  const source: BackupSource = (BACKUP_SOURCES as readonly string[]).includes(row.source)
+    ? row.source as BackupSource
+    : 'manual';
   return {
     id: row.id,
     filename: row.filename,
@@ -467,7 +539,16 @@ export function restoreBackup(db: Db, id: number): RestoreResult {
     // One transaction for the whole file: better-sqlite3 rolls it back if any
     // statement throws, so a bad dump leaves the database exactly as it was.
     db.transaction(() => {
+      // Replaying historical log rows is not new provider usage. In a full
+      // restore the ledger is restored separately; in a partial log restore
+      // the existing ledger remains authoritative. Keep DDL in this same
+      // transaction so a failed restore also restores the trigger.
+      const usageTrigger = header.tables.includes('requests')
+        ? db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'requests_key_monthly_usage'").get() as { sql: string } | undefined
+        : undefined;
+      if (usageTrigger) db.exec('DROP TRIGGER requests_key_monthly_usage');
       db.exec(sql);
+      if (usageTrigger) db.exec(usageTrigger.sql);
     })();
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
@@ -510,6 +591,17 @@ function readForeignKeysPragma(db: Db): boolean {
 /* Auto-backup scheduler                                              */
 /* ------------------------------------------------------------------ */
 
+/** `YYYY-MM-DD` on the server's local calendar. The schedule HH:MM is local
+ *  wall time, so the day key and the intervalDays span have to use that same
+ *  clock. A UTC date rolls over at a different hour, and the backup then runs
+ *  at that hour — twice on the first local day (#1888). Stored values are
+ *  already `YYYY-MM-DD`, so an existing backup_last_run_day still compares. */
+function localDayKey(now: Date): string {
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${now.getFullYear()}-${month}-${day}`;
+}
+
 export function startBackupScheduler(scheduler: Scheduler): () => void {
   let lastRunDay: string | null = getSetting(LAST_RUN_SETTING) ?? null;
 
@@ -521,7 +613,7 @@ export function startBackupScheduler(scheduler: Scheduler): () => void {
     const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
     if (hhmm < schedule.time) return;
 
-    const today = now.toISOString().slice(0, 10);
+    const today = localDayKey(now);
     if (lastRunDay === today) return;
 
     const intervalDays = Math.max(1, schedule.intervalDays);

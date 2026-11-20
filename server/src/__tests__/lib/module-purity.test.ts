@@ -32,9 +32,21 @@ const LIB = path.resolve(here, '../../lib');
 // loud in a diff.
 const PURE_MODULES = [
   'budget.ts',
+  // Shared by the provider, media and embeddings request paths (#1331).
+  'credential.ts',
   'error-classify.ts',
+  // Signal handling for the container's PID 1; the server, DB and process are injected.
+  'graceful-shutdown.ts',
   'header-value.ts',
+  // Socket peer and the nearest proxy's hop decide locality; nothing is injected (#1884).
+  'loopback.ts',
   'provider-identity.ts',
+  'provider-size-parser.ts',
+  'retry-hint.ts',
+  // Search platform list; the provider list, keys route and search service import it.
+  'search-platforms.ts',
+  // SSE keep-alive helper (#1642); env is injected, the response is a callback.
+  'stream-keepalive.ts',
   'structured-output.ts',
   'tool-args.ts',
   'tool-call-rescue.ts',

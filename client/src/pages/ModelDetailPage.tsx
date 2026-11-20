@@ -18,6 +18,7 @@ import { ModelsTabs } from '@/components/models-tabs'
 import { ModelTableHead, RateLimitBadge, RowContent } from '@/components/model-table'
 import {
   groupQuotaBadge,
+  isMemberDepleted,
   isMemberSplit,
   memberEndpointTitle,
   memberOverrideKey,
@@ -270,7 +271,7 @@ export default function ModelDetailPage() {
                 <ModelTableHead />
                 <tbody>
                   {members.map((m, i) => (
-                    <tr key={m.modelDbId} className={`border-b last:border-0 ${m.enabled ? '' : 'opacity-50'}`}>
+                    <tr key={m.modelDbId} className={`border-b last:border-0 ${m.enabled ? (isMemberDepleted(rateUsageByModel.get(m.modelDbId)) ? 'opacity-60' : '') : 'opacity-50'}`}>
                       <RowContent row={m} rank={i + 1} draggable={false} onToggle={handleToggle} providerName={memberProviderLabel(m, siblings)} providerTitle={memberEndpointTitle(m, siblings)} rateUsage={rateUsageByModel.get(m.modelDbId)} />
                     </tr>
                   ))}
@@ -416,7 +417,10 @@ function ProviderSettingsRow({
 
   const { patch, invalid, dirty } = reviewModelSettings(source, form)
   const canSave = dirty && patch !== null && !saving && !deleting
-  const sourceLabel = model.source === 'custom' ? t('models.customModel') : t('models.catalogModel')
+  const sourceLabel = model.source === 'custom'
+    ? t('models.customModel')
+    // #1348: fetched from the provider's own model list, not the catalog.
+    : model.source === 'discovered' ? t('models.discoveredModel') : t('models.catalogModel')
   // Fields whose effective value comes from a local override instead of the
   // catalog. Custom models are never catalog-managed, so this stays empty.
   const overridden = new Set(model.overrideFields ?? [])

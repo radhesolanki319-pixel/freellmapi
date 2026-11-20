@@ -63,11 +63,16 @@ Before #798, a provider that stated exactly when to come back got the same heuri
 
 Only the number is kept — never the body — so nothing extra reaches logs or attempt traces. Tests: [`server/src/__tests__/providers/stated-retry.test.ts`](../../../server/src/__tests__/providers/stated-retry.test.ts).
 
+## Provider-reported quota polling (#1403)
+
+Headers and error bodies only show quota when a request happens to carry them. Providers with a **key-info endpoint** (OpenRouter's `GET /api/v1/key` returns the key's `limit` / `limit_remaining` credit balance; SiliconFlow's `GET /v1/user/info` returns the account's `totalBalance`/`balance` in CNY as numeric strings) can be asked directly, and now are: `BaseProvider.fetchQuota()` is an optional probe that records what the provider itself reports as a `source: 'quota_api'` observation (confidence 1.0). The health pass piggybacks the probe onto a **healthy** verdict only, per key at most once per 15 minutes (`QUOTA_POLL_INTERVAL_MS`), fire-and-forget and failure-silent: a quota probe that errors or times out says nothing about the key and never changes a health verdict. Providers register their endpoint as a `quotaProbe` spec (URL + the JSON fields carrying limit/remaining); a spec may omit `limitFields` when the provider reports only a balance. Providers without a spec pay zero network. This is what fills the dashboard's live balances for pools that send no token-level rate-limit headers, instead of the text-label guess `parseBudget` makes over catalog copy.
+
 ## Health checks must not burn metered quota (#882)
 
-Health runs a scheduled pass every 5 minutes (±20% jitter, keys validated more recently than 3.5 minutes skipped, default concurrency 8, ≥1s spacing between same-provider probes). That cadence is fine for free validation endpoints but poisonous where validation itself costs quota:
+Health runs a scheduled pass every 5 minutes (±20% jitter, keys validated more recently than 3.5 minutes skipped, default concurrency 8, ≥1s spacing between same-provider probes). That cadence is fine for free validation endpoints but poisonous where validation itself costs quota. `HEALTH_CHECK_INTERVAL_MS` (milliseconds, minimum 60000, read at startup) changes it for the whole install (#1593):
 
 - ModelScope validates keys with a paid 1-token chat completion (`GET /v1/models` does not enforce auth), spending magic-grain quota — at the default cadence roughly 288 paid probes/key/day. Fix (#882): tokens not prefixed `ms-` are rejected locally with zero network calls, and a successful validation is cached per key for `MODELSCOPE_VALIDATE_CACHE_MS` (default 24h).
 - Pollinations' public `/v1/models` answers 200 even for revoked keys, so validation targets the authenticated `/account/key`; AI Horde treats any reachable endpoint as healthy rather than spending queue slots.
+- SerpSearch, Exa and keyed Parallel have no account endpoint, so their key check is a search with no query. SerpSearch revoked a user's free account over those empty searches arriving every 5 minutes (#1599). Such providers set `supportsKeyPolling = false`: the scheduled pass validates a key once (when it has never been checked), re-asks about a key parked at `error` at most hourly, and the cooldown probe skips it. Manual "Check now" / "Check all" still validate.
 
 The rule for contributors: **if `validateKey` consumes metered quota, it needs a cache or a free probe path** — see [03-adding-a-new-provider.md](03-adding-a-new-provider.md).

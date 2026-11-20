@@ -49,11 +49,16 @@ npx freellmapi setup-dsh --url http://localhost:3001 --api-key <统一密钥>
 | **Kilo Code** | `setup-kilo` | `http://localhost:3001/v1` | OpenAI Chat |
 | **Crush** | `setup-crush` | `http://localhost:3001/v1` | OpenAI Chat |
 | **DeepSeek Harness** | `setup-dsh` | `http://localhost:3001/v1` | OpenAI Chat (`api: openai-completions`) |
+| **OpenClaw** | `setup-openclaw` | `http://localhost:3001/v1` | OpenAI Chat（`api: openai-completions`） |
+| **Hermes Agent** | `setup-hermes` | `http://localhost:3001/v1` | OpenAI Chat（`provider: custom`） |
+| **Pi** | `setup-pi` | `http://localhost:3001/v1` | OpenAI Chat（`api: openai-completions`） |
+| **Reasonix** | `setup-reasonix` | `http://localhost:3001/v1` | OpenAI Chat（`kind = "openai"`） |
+| **ZCode** | `setup-zcode` | `http://localhost:3001/v1` | OpenAI Chat（`openai-chat-completions`） |
 | **QwenPaw** | 手动配置 | `http://localhost:3001/v1` | OpenAI Chat (`chat.completions`) |
 | **Cursor** | `setup-cursor` 打印指引 | 公共 `https://…/v1` | OpenAI Chat |
 | **其他** | `setup-generic` 打印现成配置块 | `http://localhost:3001/v1` | OpenAI Chat |
 
-根路径与 `/v1` 的区别很重要：Claude Code 期望服务器根路径，因为它会追加 Anthropic Messages 路径。本表中兼容 OpenAI 的客户端——包括 Cline、Aider、Goose、Codex、Continue、OpenCode、Qwen、Roo、Kilo、Crush、QwenPaw 和 DeepSeek Harness——期望它们配置的 base URL 包含 `/v1`。
+根路径与 `/v1` 的区别很重要：Claude Code 期望服务器根路径，因为它会追加 Anthropic Messages 路径。本表中兼容 OpenAI 的客户端——包括 Cline、Aider、Goose、Codex、Continue、OpenCode、Qwen、Roo、Kilo、Crush、Pi、Reasonix、QwenPaw 和 DeepSeek Harness——期望它们配置的 base URL 包含 `/v1`。
 
 ### DeepSeek Harness (`dsh`)
 
@@ -67,6 +72,64 @@ npx @deepseek-ai/dsh web
 ```
 
 设置是热重载的，所以运行中的 `dsh` 下一次请求就会用上这条路由。`--profile <name>` 添加第二条路由（`freellmapi-<name>`）而不改变默认模型；`--model <id>` 固定默认值。路由只声明文本——在 `freellmapi.models` 下给某模型条目加上 `input: [text, image]` 即可发图。尊重 `DSH_HOME`。
+
+### OpenClaw
+
+[OpenClaw](https://docs.openclaw.ai/) 是常驻运行的个人助理，通过其网关接入 WhatsApp、Telegram、Discord 等渠道。它只读取一份 JSON5 文档 `~/.openclaw/openclaw.json`，每个模型端点都是 `models.providers` 下的一个条目；其自带目录不认识的提供方必须写明 `baseUrl`、`api` 和非空的 `models` 列表。`setup-openclaw` 在那里写入一个 `freellmapi` 提供方——`api: openai-completions`、网关的 `/v1` base URL、以及实时目录作为 `models` 列表——并把 `freellmapi/auto` 设为 `agents.defaults.model.primary` 的默认模型。密钥以 OpenClaw 自己的替换语法 `${FREELLMAPI_API_KEY}` 引用，值写进 `~/.openclaw/.env`（权限 0600），这是 OpenClaw 自行加载的全局环境文件，所以无需导出。两次写入都是结构化合并：其他提供方、默认模型上的 `fallbacks`、以及文件里的其他设置保持原样。
+
+```bash
+npx freellmapi setup-openclaw --url http://localhost:3001 --api-key <统一密钥>
+npm install -g openclaw@latest --allow-scripts=openclaw
+openclaw agent exec --model freellmapi/auto "Say hello"   # 无需启动网关守护进程
+```
+
+正在运行的 `openclaw gateway` 需要重启才会读到变更。`--profile <name>` 会添加第二个提供方（`freellmapi-<name>`）而不改动默认模型；`--model <id>` 固定默认模型。OpenClaw 对自定义端点只发送 SDK 的通用 User-Agent，所以该提供方带有静态的 `User-Agent: openclaw` 请求头——Agents 页面的"最近出现"徽章正是据此点亮。模型默认声明为纯文本；给 `models.providers.freellmapi.models` 里的视觉模型加上 `input: ["text", "image"]` 即可发送图片。设置了 `OPENCLAW_CONFIG_PATH`、`OPENCLAW_STATE_DIR`、`OPENCLAW_HOME` 时会被尊重。
+
+### Hermes Agent（`hermes`）
+
+[Hermes Agent](https://hermes-agent.nousresearch.com/docs/) 是 Nous Research 的自我进化智能体，可在终端使用，也可通过其网关接入 Telegram、Discord 等聊天软件。`~/.hermes/config.yaml` 是端点的唯一事实来源：`OPENAI_BASE_URL` 只对 api.openai.com 生效，`OPENAI_API_KEY` 也只会发给 OpenAI 的主机，所以自定义端点必须写在 `model` 块里。`setup-hermes` 写入这个块——`provider: custom`、`api_mode: chat_completions`、网关的 `/v1` 作为 `base_url`、所选模型作为 `default` 并附上来自实时目录的 `context_length`——并以 Hermes 自己的替换语法 `api_key: "${FREELLMAPI_API_KEY}"` 引用密钥，值写进 `~/.hermes/.env`（权限 0600），Hermes 会自行加载。全新安装自带 `model: ""`（"尚未配置"的哨兵值）；替换它正是 `hermes setup` 会做的事，也正是无人值守首次运行能跳过向导的原因。文件里的其他键保持原样。
+
+```bash
+npx freellmapi setup-hermes --url http://localhost:3001 --api-key <统一密钥>
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup
+hermes -z "Say hello"
+```
+
+正在运行的 `hermes gateway` 需要重启才会读到变更。`--profile <name>` 改为添加 `providers.freellmapi-<name>` 条目——在对话里用 `/model custom:freellmapi-<name>:auto` 选择——不改动默认模型；`--model <id>` 固定默认模型。Hermes 对自定义端点只发送 SDK 的通用 User-Agent，所以该块带有 `default_headers: { User-Agent: hermes-agent }`，Agents 页面的"最近出现"徽章据此识别。设置了 `HERMES_HOME` 时会被尊重。
+
+### Pi（`pi`）
+
+[Pi](https://pi.dev) 是一个极简的终端智能体框架，可用你自己的扩展、技能和提示词模板来定制。Pi 未内置的端点写在 `~/.pi/agent/models.json` 的 provider 条目里。`setup-pi` 在其中添加 `freellmapi` provider——`api: openai-completions`、网关的 `/v1` 作为 `baseUrl`，并列出实时目录中的全部模型及其上下文窗口（所选模型排在最前）——再在 `~/.pi/agent/settings.json` 中设置 `defaultProvider` 和 `defaultModel`，让全新启动的 `pi` 直接使用它。Pi 不会自行加载 `.env` 文件，所以密钥直接写入 `models.json`（以 0600 权限创建）。两个文件中的其他 provider 和设置保持原样。
+
+```bash
+npx freellmapi setup-pi --url http://localhost:3001 --api-key <统一密钥>
+npm install -g @earendil-works/pi-coding-agent
+pi -p "Say hello"
+```
+
+正在运行的会话在打开 `/model` 时会重新加载 `models.json`。`--profile <name>` 改为添加 `freellmapi-<name>` provider——用 `pi --model freellmapi-<name>/<model>` 或在 `/model` 中选择——不改动默认模型；`--model <id>` 固定默认模型。模型声明为纯文本、`reasoning: false`；要给视觉模型发送图片，在其 `input` 中加上 `"image"`。Pi 对自定义端点只发送 SDK 的通用 User-Agent，所以该 provider 带有 `headers: { "User-Agent": "pi-coding-agent" }`，Agents 页面的"最近出现"徽章据此识别。设置了 `PI_CODING_AGENT_DIR` 时会被尊重。
+
+### Reasonix（`reasonix`）
+
+[Reasonix](https://github.com/esengine/DeepSeek-Reasonix) 是为 DeepSeek 原生打造、围绕前缀缓存稳定性设计的终端编程智能体。每个端点都是 `~/.reasonix/config.toml`（Windows 上为 `%APPDATA%\reasonix`，设置了 `$REASONIX_HOME` 时以其为准）中的一个 `[[providers]]` 条目。`setup-reasonix` 添加一个名为 `freellmapi` 的条目——`kind = "openai"`、网关的 `/v1` 作为 `base_url`，并列出实时目录中的全部模型（所选模型排在最前）——并把 `default_model` 指向 `freellmapi/<model>`。条目用 `api_key_env = "FREELLMAPI_API_KEY"` 引用密钥，密钥值写入 Reasonix 自行加载的 `~/.reasonix/.env`（0600），无需 export。其他 `[[providers]]` 条目和设置保持原样，重复运行只替换 `freellmapi` 条目。
+
+```bash
+npx freellmapi setup-reasonix --url http://localhost:3001 --api-key <统一密钥>
+npm install -g reasonix
+reasonix -p "Say hello"
+```
+
+目录中的每个模型都会以 `freellmapi/<id>` 出现在 `/model` 中。`--profile <name>` 改为添加 `freellmapi-<name>` 条目——用 `reasonix --model freellmapi-<name>/<model>` 选择——不改动默认模型；`--model <id>` 固定默认模型。设置了 `[desktop].provider_access` 时，Reasonix Studio 只列出其中的 provider，请把 `"freellmapi"` 加进去（或在 设置 → 模型 → 访问 中添加）。Reasonix 的 User-Agent 为 `Reasonix/<version>`，Agents 页面的"最近出现"徽章据此识别。
+
+### ZCode（`zcode`）
+
+[ZCode](https://zcode.z.ai) 是 Z.ai 为其 GLM 模型打造的编程智能体。桌面端和 CLI 共用同一个 provider 注册表 `~/.zcode/v2/provider_config.json`（可用 `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` 改变位置）。`setup-zcode` 会在其中添加一个 `freellmapi` provider：`api-key` 访问配置、指向网关 `/v1` 的 `openai-chat-completions` 端点，以及目录中每个模型的一条模型规则（含上下文和输出上限），并把 `freellmapi/auto` 设为默认模型。其他 provider、它们的模型规则和 provider 顺序都会保留，重复运行只替换 `freellmapi` 的条目。ZCode 对自定义 provider 不做环境变量查找，因此密钥保存在该文件中；写入前会先备份，并以 `0600` 权限保护。
+
+```bash
+npx freellmapi setup-zcode --url http://localhost:3001 --api-key <统一密钥>
+```
+
+运行前请退出 ZCode 桌面端，以免它把内存中的注册表写回该文件。可在模型选择器（或 CLI 的 `/model`）中选择其他 `freellmapi/<model>`。`--profile <name>` 改为添加第二个 `freellmapi-<name>` provider。ZCode 的每个请求都带有自己的 `x-zcode-app-version` 和 `x-title: Z Code@…` 请求头，Agents 页面的"最近出现"徽章据此识别。旧的 `~/.zcode/v2/config.json` 和 `~/.zcode/cli/config.json` 只在迁移时读取一次，修改它们不会生效。
 
 ### QwenPaw
 

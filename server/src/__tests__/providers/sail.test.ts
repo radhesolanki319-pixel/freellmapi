@@ -64,7 +64,7 @@ describe('SailProvider', () => {
       input: [{ role: 'user', content: 'Reply OK' }],
       background: true,
       max_output_tokens: 64,
-      metadata: { completion_window: 'asap' },
+      metadata: { completion_window: 'flex' },
       reasoning: { effort: 'none' },
       temperature: 0,
     });
@@ -133,7 +133,9 @@ describe('SailProvider', () => {
 
     expect(bodies[0].metadata).toEqual({ completion_window: 'flex' });
     expect(bodies[0].background).toBe(true);
-    expect(bodies[1].metadata).toEqual({ completion_window: 'asap' });
+    // 'asap' is rejected for background requests, so the flex window is used
+    // for every model now, not just the former flex-only roster.
+    expect(bodies[1].metadata).toEqual({ completion_window: 'flex' });
     expect(bodies[1].reasoning).toEqual({ effort: 'low' });
   });
 
@@ -151,6 +153,27 @@ describe('SailProvider', () => {
       {},
     ]);
     expect(chunks.at(-1)?.choices[0].finish_reason).toBe('stop');
+  });
+
+  it('indexes each tool call in the synthesized stream', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValue(jsonResponse({
+      id: 'resp_tools',
+      model: 'moonshotai/Kimi-K2.6',
+      status: 'completed',
+      output: [
+        { type: 'function_call', call_id: 'call_a', name: 'weather', arguments: '{"city":"Dublin"}' },
+        { type: 'function_call', call_id: 'call_b', name: 'weather', arguments: '{"city":"Paris"}' },
+      ],
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+    }));
+    const provider = new SailProvider({ pollIntervalMs: 0 });
+    const chunks = [];
+    for await (const chunk of provider.streamChatCompletion(
+      'k', [{ role: 'user', content: 'Weather?' }], 'moonshotai/Kimi-K2.6',
+    )) chunks.push(chunk);
+
+    const calls = chunks.flatMap(chunk => (chunk.choices[0].delta.tool_calls ?? []) as any[]);
+    expect(calls.map(c => [c.index, c.id])).toEqual([[0, 'call_a'], [1, 'call_b']]);
   });
 
   it('validates keys against the authenticated model roster and preserves errors', async () => {

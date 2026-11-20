@@ -1,14 +1,19 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { app, dialog, ipcMain, clipboard, nativeTheme, screen, shell, type Tray } from 'electron';
-import { startServer, ensureSessionToken, getUnifiedApiKey } from './server.mjs';
+import { app, dialog, ipcMain, clipboard, nativeTheme, net, screen, shell, type Tray } from 'electron';
+import { startServer, ensureSessionToken, getUnifiedApiKey, isAutoUpdateCheckEnabled, backupBeforeUpdate, outboundProxyUrl, setCatalogFallbackFetch } from './server.mjs';
 import { loadConfig, saveConfig } from './config.js';
 import { installFileLogger } from './logger.js';
-import { buildTray, refreshTrayLocale } from './tray.js';
+import { buildTray, refreshTrayLocale, refreshTrayMenu } from './tray.js';
 import { trayIsInMenuBar } from './tray-visibility.js';
-import { openDashboard } from './window.js';
+import { shouldOpenDashboardOnLaunch } from './tray-platform.js';
+import { registerAgentSetup } from './agent-setup.js';
+import { getDashboardWindow, openDashboard } from './window.js';
 import { todayStats, hourlyRequests, successRateToday } from './stats.js';
 import { normalizeLocale, nativeStrings, type NativeLocale } from './i18n.js';
+import { installGpuRecovery } from './gpu-recovery-host.js';
+import { initUpdater, getUpdateState, checkForUpdates, downloadUpdate, installUpdate, checkFromTray } from './updater.js';
+import { gatewayBaseUrl, parseBaseUrlKind } from './base-urls.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PORT = 31415;
@@ -26,6 +31,9 @@ if (!app.requestSingleInstanceLock()) {
   // without this the server's console output — the password-reset code above
   // all (#824) — is written nowhere the user can read it.
   installFileLogger();
+
+  // Before 'ready': GPU switches only take effect if set now (#1759).
+  installGpuRecovery();
 
   let resolvedPort = DEFAULT_PORT;
   let sessionToken = '';
@@ -101,6 +109,8 @@ if (!app.requestSingleInstanceLock()) {
     });
   });
 
+  registerAgentSetup({ port: () => resolvedPort, key: getUnifiedApiKey, dashboard: getDashboardWindow });
+
   // ── popover IPC ──────────────────────────────────────────────────────────
   ipcMain.handle('freeapi:snapshot', () => {
     const s = todayStats();
@@ -148,10 +158,18 @@ if (!app.requestSingleInstanceLock()) {
     getPopoverWindow()?.webContents.send('freeapi:refresh');
   });
   ipcMain.handle('freeapi:open-dashboard', () => openDashboard(resolvedPort, sessionToken));
-  ipcMain.handle('freeapi:copy-base-url', () => clipboard.writeText(`http://127.0.0.1:${resolvedPort}/v1`));
+  ipcMain.handle('freeapi:copy-base-url', (_e, kind: unknown) =>
+    clipboard.writeText(gatewayBaseUrl(resolvedPort, parseBaseUrlKind(kind))));
   ipcMain.handle('freeapi:copy-api-key', () => clipboard.writeText(getUnifiedApiKey()));
+  ipcMain.handle('freeapi:get-login-item', () => app.getLoginItemSettings().openAtLogin);
   ipcMain.handle('freeapi:set-login-item', (_e, open: boolean) => app.setLoginItemSettings({ openAtLogin: open }));
   ipcMain.handle('freeapi:quit', () => app.quit());
+  // Dashboard → the in-app updater (preload __FREEAPI_UPDATER__). Each call
+  // returns the new state; progress arrives as 'freeapi:update-state' events.
+  ipcMain.handle('freeapi:update-state', () => getUpdateState());
+  ipcMain.handle('freeapi:update-check', () => checkForUpdates());
+  ipcMain.handle('freeapi:update-download', () => downloadUpdate());
+  ipcMain.handle('freeapi:update-install', () => installUpdate());
   // Dashboard → a fresh session for the hidden machine account (preload
   // __FREEAPI_SESSION__). The window never shows a login form: its account has
   // a random password nobody knows, so when the boot-time session is gone the
@@ -178,7 +196,8 @@ if (!app.requestSingleInstanceLock()) {
         detail:
           'The server will bind to 0.0.0.0 so other devices (Tailscale, VMs, ' +
           'phones on your Wi-Fi) can reach it at http://<this-machine-ip>:' +
-          `${resolvedPort}/v1.\n\nThe API is protected only by your unified ` +
+          `${resolvedPort}/v1 (OpenAI-style clients) or http://<this-machine-ip>:` +
+          `${resolvedPort} (Claude / Anthropic clients, no /v1).\n\nThe API is protected only by your unified ` +
           'API key. Only do this on a network you trust. The app will restart ' +
           'to apply the change.',
       });
@@ -241,6 +260,7 @@ if (!app.requestSingleInstanceLock()) {
     const next = !(loadConfig().showInDock ?? true);
     saveConfig({ ...loadConfig(), showInDock: next });
     applyDockVisibility(next);
+    refreshTrayMenu();
   }
 
   app.whenReady().then(async () => {
@@ -268,6 +288,24 @@ if (!app.requestSingleInstanceLock()) {
     // the app the user actually launched (#703).
     process.env.FREEAPI_VERSION = app.getVersion();
 
+    initUpdater({
+      autoCheckEnabled: () => {
+        try { return isAutoUpdateCheckEnabled(); } catch { return false; }
+      },
+      backupBeforeUpdate,
+      outboundProxyUrl: () => {
+        try { return outboundProxyUrl(); } catch { return ''; }
+      },
+      getLocale: () => locale,
+      // The Linux tray menu is attached, not rebuilt per click (#1804).
+      onChange: () => refreshTrayMenu(),
+    });
+
+    // License activation and catalog sync retry through Chromium's network
+    // stack (OS certificate store + system proxy) when Node's fetch can't
+    // reach api.freellmapi.co, which some Windows PCs hit as "HTTP 502".
+    setCatalogFallbackFetch((input, init) => net.fetch(String(input), init));
+
     try {
       const { port } = await startServer({
         dbPath,
@@ -278,28 +316,48 @@ if (!app.requestSingleInstanceLock()) {
       resolvedPort = port;
       saveConfig({ ...cfg, port });
       sessionToken = ensureSessionToken();
-      const tray = buildTray(
-        port,
-        sessionToken,
-        () => locale,
-        () => loadConfig().lanAccess ?? false,
-        toggleLanAccess,
-        () => loadConfig().showInDock ?? true,
-        toggleShowInDock,
-      );
+      // The server is already up, so a tray that fails to build must not take
+      // the app down with it: fall back to the dashboard window (#1353).
+      let tray: Tray | null = null;
+      try {
+        tray = buildTray(
+          port,
+          sessionToken,
+          () => locale,
+          () => loadConfig().lanAccess ?? false,
+          toggleLanAccess,
+          () => loadConfig().showInDock ?? true,
+          toggleShowInDock,
+          getUpdateState,
+          () => void checkFromTray(),
+        );
+      } catch (err) {
+        console.warn('[desktop] could not create the tray icon:', err);
+      }
       console.log(`[desktop] FreeLLMAPI running on http://${host}:${port}${cfg.lanAccess ? ' (LAN access enabled)' : ''}`);
       // A tray that macOS refuses to draw still constructs cleanly, so the only
       // way to notice is to look at where the item landed (#807).
-      if (process.platform === 'darwin') setTimeout(() => reportHiddenTray(tray, port), TRAY_PROBE_DELAY_MS);
+      if (tray && process.platform === 'darwin') {
+        const built = tray;
+        setTimeout(() => reportHiddenTray(built, port), TRAY_PROBE_DELAY_MS);
+      }
+
+      const welcomedBefore = loadConfig().launchDashboardShown ?? false;
+      if (
+        !process.env.FREEAPI_SHOT
+        && shouldOpenDashboardOnLaunch(process.platform, { trayBuilt: tray !== null, welcomedBefore })
+      ) {
+        openDashboard(port, sessionToken);
+        if (!welcomedBefore) saveConfig({ ...loadConfig(), launchDashboardShown: true });
+      }
 
       // Dev-only UI verification: FREEAPI_SHOT=1 opens the popover and the
       // dashboard, captures both to /tmp, and quits. FREEAPI_SHOT=hold opens
       // the popover and keeps it pinned (blur ignored) so a real screen
       // capture can include the compositor's vibrancy. Never set when packaged.
-      if (process.env.FREEAPI_SHOT && !app.isPackaged) {
+      if (tray && process.env.FREEAPI_SHOT && !app.isPackaged) {
         const fs = await import('node:fs');
         const { togglePopover, getPopoverWindow } = await import('./popover.js');
-        const { getDashboardWindow } = await import('./window.js');
         const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
         await sleep(800);
         togglePopover(tray);

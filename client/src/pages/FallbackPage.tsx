@@ -21,6 +21,8 @@ import { useI18n } from '@/i18n'
 import { apiFetch } from '@/lib/api'
 import {
   buildGroups,
+  clampRankToIndex,
+  isGroupDepleted,
   groupMatchesQuery,
   groupMaxContext,
   type FallbackEntry,
@@ -46,6 +48,9 @@ import { ModelsTabs } from '@/components/models-tabs'
 import { Tooltip } from '@/components/tooltip'
 import { PenaltyInspector } from '@/components/penalty-inspector'
 import { PeakHoursControls } from '@/components/peak-hours-controls'
+import { ReliabilityFloorControl } from '@/components/reliability-floor-control'
+import { ProviderMomentControl } from '@/components/provider-moment-control'
+import { DecisionRoutingPopover, DecisionSetupGuide } from '@/components/decision-routing-popover'
 import { ChainManager } from '@/components/chain-manager'
 
 // `tKey` is the i18n suffix under `strategies.*` (label) and `strategies.*Blurb`.
@@ -57,6 +62,7 @@ const STRATEGIES: { key: RoutingStrategy; tKey: string }[] = [
   { key: 'fastest', tKey: 'fastest' },
   { key: 'reliable', tKey: 'reliable' },
   { key: 'custom', tKey: 'custom' },
+  { key: 'decision', tKey: 'decision' },
 ]
 
 // Minimum-context filter buckets for the Models page toolbar. `key` is the token
@@ -177,6 +183,7 @@ export default function FallbackPage() {
       strategy: RoutingStrategy; weights?: RoutingWeights; exploreEnabled?: boolean
       peakHoursAdjust?: boolean; peakStartHour?: number; peakEndHour?: number; peakTimezone?: string
       keySelectionStrategy?: KeySelectionStrategy; cooldownCeilingMs?: number | null
+      decisionModel?: string; decisionMinProbability?: number
     }) =>
       apiFetch('/api/fallback/routing', { method: 'PUT', body: JSON.stringify(payload) }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] }),
@@ -229,7 +236,7 @@ export default function FallbackPage() {
 
   // ── Model unification: a model served by several providers is always shown as
   // one logical row that links to its own page (the on/off toggle was removed). ─
-  const orderedGroups = useMemo(() => buildGroups(rows, isManual), [rows, isManual])
+  const orderedGroups = useMemo(() => buildGroups(rows, isManual, rateUsageByModel), [rows, isManual, rateUsageByModel])
 
   // Catalog search + filters (#343). Filtering operates on whole logical-model
   // groups; rank stays the model's position in the full chain so the numbers
@@ -303,6 +310,19 @@ export default function FallbackPage() {
     setLocalEntries(allEntries.map(e => ({ ...e, priority: prio.get(e.modelDbId) ?? e.priority })))
   }
 
+  // Jump-to-rank (#1317): type a target rank instead of dragging a model across
+  // a long chain. Same staging path as drag — persistGroupOrder serializes the
+  // new display order into localEntries and Save commits it. The typed rank is
+  // clamped to the chain, so 1 means "front of the queue" and an over-the-end
+  // number means "last" without needing a validation error.
+  function handleMoveGroupRank(key: string, toRank: number) {
+    const oldI = orderedGroups.findIndex(g => g.key === key)
+    if (oldI < 0) return
+    const newI = clampRankToIndex(toRank, orderedGroups.length)
+    if (newI === oldI) return
+    persistGroupOrder(arrayMove(orderedGroups, oldI, newI))
+  }
+
   // Reorder models (the failover priority order). Providers within a model are
   // ordered by the active strategy and managed on the model's own page.
   function handleGroupedDragEnd(event: DragEndEvent) {
@@ -358,26 +378,49 @@ export default function FallbackPage() {
               secondary hangs off that toggle so the card reads as one choice. */}
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="inline-flex flex-wrap items-center gap-1 rounded-xl border p-1">
-              {STRATEGIES.map(s => (
-                <Tooltip key={s.key} text={t(`strategies.${s.tKey}Blurb`)}>
-                  <button
-                    disabled={strategyMutation.isPending}
-                    onClick={() => strategyMutation.mutate({ strategy: s.key })}
-                    className={`px-3 py-1.5 text-xs rounded-lg transition-colors ${
-                      s.key === strategy
-                        ? 'bg-foreground text-background font-medium'
-                        : 'text-muted-foreground hover:text-foreground hover:bg-muted'
-                    }`}
-                  >
-                    {t(`strategies.${s.tKey}`)}
-                  </button>
-                </Tooltip>
-              ))}
+              {STRATEGIES.map(s => {
+                const pillClass = `px-3 py-1.5 text-xs rounded-lg transition-colors ${
+                  s.key === strategy
+                    ? 'bg-foreground text-background font-medium'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                }`
+                // Decision with nothing able to decide (#1354): the pill opens a
+                // setup guide instead of switching to a strategy that would
+                // route everything as Balanced.
+                const needsSetup = s.key === 'decision' && strategy !== 'decision' && routing?.decision && !routing.decision.ready
+                // The guide explains itself, so it skips the hover blurb, which
+                // would otherwise sit on top of the guide's buttons.
+                if (needsSetup && routing?.decision) {
+                  return (
+                    <DecisionSetupGuide key={s.key} status={routing.decision} className={pillClass}>
+                      {t(`strategies.${s.tKey}`)}
+                    </DecisionSetupGuide>
+                  )
+                }
+                return (
+                  <Tooltip key={s.key} text={t(`strategies.${s.tKey}Blurb`)}>
+                    <button
+                      disabled={strategyMutation.isPending}
+                      onClick={() => strategyMutation.mutate({ strategy: s.key })}
+                      className={pillClass}
+                    >
+                      {t(`strategies.${s.tKey}`)}
+                    </button>
+                  </Tooltip>
+                )
+              })}
               {strategy === 'custom' && routing && (
                 <CustomWeightsPopover
                   saved={routing.customWeights}
                   saving={strategyMutation.isPending}
                   onSave={w => strategyMutation.mutate({ strategy: 'custom', weights: w })}
+                />
+              )}
+              {strategy === 'decision' && routing?.decision && (
+                <DecisionRoutingPopover
+                  status={routing.decision}
+                  saving={strategyMutation.isPending}
+                  onSave={settings => strategyMutation.mutate({ strategy: 'decision', ...settings })}
                 />
               )}
             </div>
@@ -473,6 +516,16 @@ export default function FallbackPage() {
                   onSave={p => strategyMutation.mutate({ strategy, ...p })}
                 />
               )}
+
+              {/* Minimum reliability floor (#filter): independent of the strategy
+                  snapshot — lives in settings, so it owns its own query/mutation.
+                  Shown in every mode; the floor pre-filters the candidate chain
+                  regardless of how models are ranked. */}
+              <ReliabilityFloorControl />
+              {/* Provider-moment failure attribution (#1347, opt-in): 429s, 5xx,
+                  timeouts and transport drops steer the key without counting
+                  against the model's reliability. Off by default. */}
+              <ProviderMomentControl />
             </div>
           )}
 
@@ -598,7 +651,7 @@ export default function FallbackPage() {
                     <SortableContext items={renderedGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
                       <tbody>
                         {renderedGroups.map(g => (
-                          <SortableGroupRow key={g.key} group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                          <SortableGroupRow key={g.key} group={g} rank={rankByKey.get(g.key) ?? 0} editableRank onMoveRank={r => handleMoveGroupRank(g.key, r)} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
                         ))}
                       </tbody>
                     </SortableContext>
@@ -614,7 +667,7 @@ export default function FallbackPage() {
                       <tr
                         key={g.key}
                         onClick={() => navigate(`/models/chat/${encodeURIComponent(g.members[0].canonicalId ?? g.members[0].modelId)}`)}
-                        className={`group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg ${g.members.some(m => m.enabled) ? '' : 'opacity-50'}`}
+                        className={`group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg ${g.members.some(m => m.enabled) ? (isGroupDepleted(g.members, rateUsageByModel) ? 'opacity-60' : '') : 'opacity-50'}`}
                       >
                         <GroupHeaderCells group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
                       </tr>

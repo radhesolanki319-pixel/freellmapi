@@ -19,7 +19,12 @@ publish:
   owner: tashfeenahmed
   repo: freellmapi
 asar: true
+# Linux chrome-sandbox must be mode 4755 (setuid) in the .deb; otherwise
+# Electron aborts at launch (#1229). Path is relative to desktop/.
+afterPack: ./scripts/after-pack-linux-sandbox.mjs
+afterSign: ./scripts/after-sign-notarize.mjs
 asarUnpack:
+  - "**/node_modules/@img/**"
   - "**/node_modules/better-sqlite3/**/*.node"
   - "**/node_modules/better-sqlite3/build/Release/**"
 # client-dist is staged into desktop/ by `npm run stage:client` (scripts/stage-client.mjs).
@@ -29,17 +34,23 @@ extraResources:
   - from: client-dist
     to: client-dist
 mac:
+  artifactName: "${productName}-${version}-macos-${arch}.${ext}"
   category: public.app-category.developer-tools
   icon: assets/icon.icns
   hardenedRuntime: true
   gatekeeperAssess: false
   entitlements: assets/entitlements.mac.plist
   entitlementsInherit: assets/entitlements.mac.inherit.plist
-  notarize: true
+  # Notarization runs in afterSign (scripts/after-sign-notarize.mjs) rather
+  # than electron-builder's built-in step, which staples once and fails the
+  # whole build when Apple's ticket lookup drops the connection (v0.14.0/1).
+  notarize: false
+  # Select the architecture with --arm64 or --x64 in the build command.
+  # Per-target arch lists override that selection and make each CI job build
+  # both architectures, including the native SQLite module for the other CPU.
   target:
     - target: dmg
-      arch:
-        - arm64
+    - target: zip
   extendInfo:
     LSUIElement: 1
 # The DMG is the file people actually download, so it is the file macOS
@@ -61,6 +72,31 @@ win:
         - x64
   # electron-builder converts a >=256px PNG to .ico at build time.
   icon: assets/appicon_1024.png
+# Microsoft Store package (#1933). Windows Smart App Control blocks the
+# unsigned NSIS .exe outright; an MSIX submitted to the Store is signed by
+# Microsoft, so Store installs run with Smart App Control on. Built only by
+# `npm run dist:store` / the release workflow's Store step, never alongside the
+# NSIS target. The identity values must match Partner Center's Product
+# identity page for product 9PBN6G8K2B7F exactly, or the Store rejects the
+# upload. Tile images live in store-assets/appx (the store build points
+# buildResources there, because build/ here is compiled app code).
+appx:
+  identityName: TashAhmed.FreeLLMAPI
+  publisher: CN=157744EA-1B8F-40BE-9B6E-1FE92036B40F
+  publisherDisplayName: Tash Ahmed
+  applicationId: FreeLLMAPI
+  displayName: FreeLLMAPI
+  backgroundColor: transparent
+  languages:
+    - en-US
+  # electron-builder defaults to MinVersion 10.0.14316 (1607), which Partner
+  # Center rejects for MSIX ("MinVersion <= 10.0.17134.0"). Electron 38 needs
+  # Windows 10 1809+ anyway.
+  minVersion: 10.0.17763.0
+  maxVersionTested: 10.0.26100.0
+  # .msix, not .appx: same package format, and `msstore publish` only picks up
+  # .msix / .msixupload files.
+  artifactName: "${productName}-Store-${version}.msix"
 linux:
   category: Development;Utility;
   icon: assets/appicon_1024.png # electron-builder can automatically scale PNGs
@@ -78,5 +114,12 @@ linux:
       arch:
         - x64
 nsis:
+  # electron-builder's default NSIS name has spaces ("FreeLLMAPI Setup x.y.z.exe")
+  # and latest.yml records it with dashes, while GitHub stores the upload with
+  # dots — so the updater asked for a file the release did not have. A name with
+  # no spaces is the same string in all three places.
+  artifactName: "${productName}-Setup-${version}.${ext}"
   oneClick: true
+  # Grants the GPU sandbox read access to the install folder (#1759).
+  include: installer/installer.nsh
   deleteAppDataOnUninstall: false

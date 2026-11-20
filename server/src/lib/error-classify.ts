@@ -5,6 +5,7 @@
 
 export function isRetryableError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
+  if (err?.status === 400 && (err?.providerRejection === 'upstream' || err?.providerRejection === 'request' || err?.providerRejection === 'model')) return true;
   // Trust the upstream HTTP status the provider attached to the error first
   // (providerHttpError in providers/base.ts sets err.status on every adapter).
   // This structured check is the robust primary signal; the message-substring
@@ -15,28 +16,29 @@ export function isRetryableError(err: any): boolean {
   // the chain — because the old code matched specific substrings and ignored
   // err.status for every code except 403. 408 (request timeout), 409 (conflict),
   // 410 (model pulled upstream), 429 (rate limit) and all 5xx are transient or
-  // fail-over-able; 400/401 stay fatal (status 0 here, handled by the absence of a
-  // matching rule) and 403 is handled by isModelAccessForbiddenError below.
+  // fail-over-able. Bare 400 and 401 stay fatal; explicitly marked provider-side
+  // 400s may fail over. 403 is handled by isModelAccessForbiddenError below.
   // 422 (notably Mistral's strict validation) is a provider-side request-shape
   // rejection: fail over to another provider, but if the whole chain rejects it
   // exhaustedRetryError renders a client-facing 400 via isProviderBadRequestError.
   const status = typeof err?.status === 'number' ? err.status : 0;
-  if (status === 408 || status === 409 || status === 410 || status === 422 || status === 429 || status >= 500) return true;
-  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
+  if (status === 404 || status === 408 || status === 409 || status === 410 || status === 413 || status === 422 || status === 429 || status >= 500) return true;
+  const codeInMessage = status === 0 && /\b(?:404|410|413|429|500|503)\b/.test(msg);
+  return codeInMessage || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')
     || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('fetch failed')    // undici transport error (proxy down, DNS, TLS, etc.)
-    || msg.includes('503') || msg.includes('unavailable')
+    || msg.includes('unavailable')
     // Provider marks the hosted deployment itself as sick (NVIDIA NIM's
     // "DEGRADED function cannot be invoked" arrives as a 400, #522). The
     // 'api error 400' rule below already catches the NIM shape; this keeps
     // degraded conditions retryable even when a provider words it differently.
     || msg.includes('degraded')
-    || msg.includes('500') || msg.includes('internal server error')
+    || msg.includes('internal server error')
     // 413: this model's payload limit is too small for the request, but another
     // provider in the fallback chain may have a larger limit. Same reasoning as 503.
-    || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
+    || msg.includes('payload too large') || msg.includes('request body too large')
     || msg.includes('request entity too large') || msg.includes('content too large')
     // Context/prompt-too-large in all its provider wordings (Anthropic "prompt
     // is too long", Google "input token count ... exceeds", OpenAI "maximum
@@ -47,13 +49,13 @@ export function isRetryableError(err: any): boolean {
     // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
     // for a model that's been pulled). Rotate to the next model in the chain —
     // setCooldown + the health checker will avoid this model on subsequent requests.
-    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
+    || msg.includes('not found') || msg.includes('no endpoints found')
     // 410: the model/endpoint was permanently removed upstream (e.g. Ollama Cloud
     // "API error 410: Gone", #339). Like a 404 it won't return on this provider, so
     // rotate to the next route; isModelNotFoundError benches the whole model. The
     // structured status check above already catches the 410 when the provider
     // attaches err.status — this is the text fallback for errors that don't.
-    || msg.includes('410') || msg.includes('gone')
+    || msg.includes('gone')
     // 403: the key is valid (it passed validateKey, and the health checker
     // disables truly-forbidden keys) but this specific model is off-limits to
     // the key's tier — e.g. gpt-4o on GitHub Models' free tier, subscription-only
@@ -63,8 +65,8 @@ export function isRetryableError(err: any): boolean {
     || isModelAccessForbiddenError(err)
     // 400: one provider may reject parameters another accepts (e.g. max_tokens
     // limits, unsupported params). The matching pattern is "api error 400"
-    // which comes from the OpenAI-compat provider's error formatting, not
-    // a bare "400" which is deliberately non-retryable for validation errors.
+    // which comes from the OpenAI-compat provider's error formatting. Marked
+    // provider rejections are handled above; bare validation 400s stay fatal.
     || msg.includes('api error 400')
     // 422: Mistral and other strict OpenAI-compatible endpoints use
     // Unprocessable Entity for request-shape validation. Rotate to a provider
@@ -352,8 +354,17 @@ export function isKeyAuthError(err: any): boolean {
 // makes the router re-pick a dead-for-the-day provider all day, so the caller
 // benches until the next UTC midnight instead. Requires BOTH a daily marker and
 // a quota/allocation marker so an ordinary per-minute 429 never matches.
+//
+// Groq ends every limit error, per-minute and request-too-large alike, with
+// "Need more tokens? Upgrade to Dev Tier today at …". That "today" is sales
+// copy, not a window, so it is cut before looking for a daily marker; and a
+// request too big for the model is never a spent allowance.
+const UPGRADE_UPSELL = /\bupgrade to [^.?!]*?\btoday\b/g;
+
 export function isDailyQuotaExhaustedError(err: any): boolean {
-  const msg = (err?.message ?? '').toLowerCase();
+  if (err?.dailyQuotaExhausted === true) return true;
+  if (isContextTooLargeError(err)) return false;
+  const msg = (err?.message ?? '').toLowerCase().replace(UPGRADE_UPSELL, '');
   if (!/daily|per[ -_]?day|\btoday\b/.test(msg)) return false;
   return /allocation|quota|limit|exhaust|used up/.test(msg);
 }
@@ -367,6 +378,19 @@ export function isDailyQuotaExhaustedError(err: any): boolean {
 export function isProviderDegradedError(err: any): boolean {
   const msg = (err?.message ?? '').toLowerCase();
   return msg.includes('degraded');
+}
+
+// A 5xx whose body blames ONE model's load, not the provider: Google answers
+// `503 "This model is currently experiencing high demand"` for a busy Gemini
+// model while its siblings on the same key keep serving. Ruling the whole
+// platform out on it left `auto` with nothing to try when that platform was
+// the only one configured. Narrow on purpose: the wording must name "this
+// model" / "the model", so a generic "service overloaded" stays provider-level.
+const MODEL_SCOPED_OVERLOAD = /\b(?:this|the) model is (?:currently )?(?:experiencing high demand|overloaded)\b/;
+
+export function isModelScopedOverloadError(err: any): boolean {
+  return typeof err?.status === 'number' && err.status >= 500
+    && MODEL_SCOPED_OVERLOAD.test((err?.message ?? '').toLowerCase());
 }
 
 // #788: provider-level failures — 5xx, timeouts, transport/network errors, a
@@ -394,7 +418,7 @@ export function isProviderLevelError(err: any): boolean {
   // the text is not.
   if (err?.skipModelForRequest === true) return false;
   const status = typeof err?.status === 'number' ? err.status : 0;
-  if (status >= 500) return true;
+  if (status >= 500) return !isModelScopedOverloadError(err);
   // A DEGRADED hosted deployment (NVIDIA NIM, #522) is provider health wearing
   // a 400 — same source of truth as everywhere else, not a second substring.
   if (isProviderDegradedError(err)) return true;
@@ -403,6 +427,36 @@ export function isProviderLevelError(err: any): boolean {
   return isTimeoutErrorText(msg)
     || msg.includes('econnrefused') || msg.includes('econnreset')
     || msg.includes('fetch failed');   // undici transport error (DNS/TLS/proxy down)
+}
+
+// #1347 (PR 1): provider-moment failures — the "provider had a bad minute"
+// class: a 429, a 5xx, a degraded deployment, a timeout, a transport drop
+// (including a mid-stream reset / truncated SSE), or rate-limit wording on a
+// response that carried no structured status. This is evidence about the
+// provider's minute, not the model's quality: when failure attribution is
+// enabled such failures still steer the key (the cooldown ladder is
+// untouched) but are excluded from the model-level books — the reliability
+// stats and the failure penalties. Deliberately NOT in this class: auth
+// (401/403), quota (402), model-not-found (404/410), context-too-large,
+// empty completions and model-scoped 400s, which keep their existing
+// key/model-scoped handling.
+export function isProviderMomentFailure(err: any): boolean {
+  // A canceled request (client hang-up, time-budget hedge) is the gateway's
+  // own doing. isTransportError already treats those as non-transport, but
+  // the timeout-marker text check below could still match an abort message.
+  if (isClientAbortError(err) || isHedgeAbortError(err)) return false;
+  if (err?.skipModelForRequest === true) return false;
+  const status = typeof err?.status === 'number' ? err.status : 0;
+  if (status === 429 || status >= 500) return true;
+  if (isProviderDegradedError(err)) return true;
+  if (isTransportError(err)) return true;
+  if (isStreamTruncatedError(err)) return true;
+  const msg = (err?.message ?? '').toLowerCase();
+  if (isTimeoutErrorText(msg)) return true;
+  // Rate-limit wording without a structured status: some gateways answer a
+  // throttled request with a 200/500 body that only says "rate limit".
+  if (status === 0 && (msg.includes('rate limit') || msg.includes('too many requests'))) return true;
+  return false;
 }
 
 // #809: kilo's free relay occasionally answers with a bare classification
@@ -431,7 +485,7 @@ export function isProviderBadRequestError(err: any): boolean {
   if (isProviderDegradedError(err)) return false;
   const status = typeof err?.status === 'number' ? err.status : 0;
   const msg = (err?.message ?? '').toLowerCase();
-  if (status === 400) return msg.includes('api error 400');
+  if (status === 400) return err?.providerRejection === 'upstream' || err?.providerRejection === 'request' || msg.includes('api error 400');
   if (status === 422) return msg.includes('api error 422') || msg.includes('unprocessable entity');
   if (status !== 0) return false;
   return msg.includes('api error 400') || msg.includes('api error 422') || msg.includes('unprocessable entity');
@@ -463,14 +517,29 @@ export function isContextTooLargeError(err: any): boolean {
   if (typeof err?.code === 'string' && err.code.toLowerCase() === 'context_length_exceeded') return true;
   const msg = (err?.message ?? '').toLowerCase();
   return msg.includes('context_length_exceeded')
+    // Agnes AI and some OpenAI-compat aggregators raise a bare
+    // ContextWindowExceededError whose OpenAIException body arrives truncated
+    // mid-sentence ("The input (2250074 tokens) is longer than the mo…"), so
+    // the "maximum context length" marker below never sees its target text and
+    // the error was mis-bucketed as provider_bad_request. The exception class
+    // name is the only reliable signal left in that shape.
+    || msg.includes('contextwindowexceeded')
     || msg.includes('maximum context length')
     || msg.includes('context length exceeded')
     || /exceeds[^.]*context (length|window|size)/.test(msg)
     || msg.includes('prompt is too long')
     || msg.includes('input is too long')
     || /input token count[^.]*exceeds/.test(msg)
+    // "The input (N tokens) is longer than the max/maximum" family, worded
+    // differently by aggregators that never surface an exception class.
+    || /input[^.]*longer than (the )?(max|maximum)/.test(msg)
     || msg.includes('exceeds the maximum number of tokens')
     || msg.includes('request too large')
+    // BazaarLink: 400 "This request is too large for a free tier" (#1717).
+    // No window named, but it is a size rejection: without this it was
+    // bucketed as provider_bad_request and the next candidate got the same
+    // oversized payload.
+    || msg.includes('request is too large')
     || msg.includes('payload too large')
     || msg.includes('request entity too large')
     || msg.includes('request body too large')
@@ -485,12 +554,33 @@ export function isContextTooLargeError(err: any): boolean {
 // A 402 Payment Required / out-of-credits error. Distinct from a transient 429:
 // it won't recover on the next window, so the caller benches the model+key with
 // PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.
+//
+// The digits 402 only count as the STATUS. A bare `includes('402')` also
+// matched token counts and request ids ("Limit 30000, Requested 34026",
+// "14023 tokens used"), and since the 402 bench covers the key on every model
+// of the platform for a day (#1239), one unlucky number took a whole provider
+// out. So: an error that states another status is never a 402 by its digits,
+// and otherwise 402 has to stand alone rather than sit inside a longer number.
+const STATED_STATUS = /\bapi error (\d{3})\b|\(http (\d{3})\)/;
+const STANDALONE_402 = /(?<![\w.])402(?![\w.])/;
+
 export function isPaymentRequiredError(err: any): boolean {
-  const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('402') || msg.includes('payment required')
+  const msg = String(err?.message ?? '').toLowerCase();
+  if (msg.includes('payment required')
     || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
-    || msg.includes('insufficient balance');
+    || msg.includes('insufficient balance')) return true;
+
+  const stated = msg.match(STATED_STATUS);
+  const status = typeof err?.status === 'number' ? err.status : Number(stated?.[1] ?? stated?.[2]);
+  if (Number.isFinite(status)) return status === 402;
+  return STANDALONE_402.test(msg);
 }
+
+// "model 'x' does not exist" / "model \"x\" does not exist" / "model x does not
+// exist" — one non-space token (optionally quoted) between the word "model" and
+// the verdict. Bounded so an unrelated sentence containing both words never
+// matches; the model id itself is never inspected.
+const MODEL_ID_DOES_NOT_EXIST = /\bmodel\b\s+['"`]?[^\s'"`]{1,200}['"`]?\s+(?:does\s+not|doesn't)\s+exist\b/;
 
 // A 404 "model removed/deprecated upstream" error. It's a MODEL-level failure,
 // not a key-level one: every key for the platform will 404 the same way, so the
@@ -504,8 +594,50 @@ export function isModelNotFoundError(err: any): boolean {
   // added for #339 (Ollama Cloud "Gone"); prefer the structured status when present.
   if (err?.status === 404 || err?.status === 410) return true;
   const msg = (err?.message ?? '').toLowerCase();
-  return msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
-    || msg.includes('410') || msg.includes('gone');
+  return ((typeof err?.status !== 'number' || err.status === 0) && /\b(?:404|410)\b/.test(msg))
+    || msg.includes('not found') || msg.includes('no endpoints found') || msg.includes('gone')
+    // Some aggregators report a removed/stale model with a 400 (not a 404) whose
+    // body reads "No model found: <id>", "model not found", "unknown model" or
+    // "model does not exist" (#: Routeway 400 "No model found: llama-3.3-70b-instruct:free").
+    // Note "No model found" does NOT contain the substring "not found" (words are
+    // no/model/found), so it slipped past the checks above and fell through to
+    // isProviderBadRequestError — surfacing as a request-blaming 400 instead of a
+    // stale-catalog 404. These phrasings are MODEL-level (every sibling key fails
+    // identically), so they belong here for the whole-model skip.
+    || msg.includes('no model found') || msg.includes('model not found')
+    || msg.includes('unknown model') || msg.includes('model does not exist')
+    || msg.includes('no such model')
+    // The same verdict with the model id quoted in the middle (#1239: NavyAI
+    // 400 "The model 'o3-mini' does not exist or is not supported for chat
+    // completions."). The bare "model does not exist" substring above never
+    // matches that wording, so every one of a platform's stale rows was booked
+    // as provider_bad_request — no whole-model skip, a hop burned per dead
+    // model, and the exhaustion body blamed the caller's request.
+    || MODEL_ID_DOES_NOT_EXIST.test(msg)
+    // "not supported for chat completions" is MODEL-level too: the id is real
+    // but this platform cannot serve it on the endpoint we use, and a sibling
+    // key would be told the same. Route it out for the request like a 404.
+    || msg.includes('not supported for chat completions')
+    || (err?.status === 400 && err?.providerRejection === 'model');
+}
+
+
+// A 403 that suspends the ACCOUNT, not one model: NavyAI answers every model
+// behind a benched free key with "The Free plan is temporarily disabled due to
+// abuse. You can purchase a plan ...". Every model of the platform fails the
+// same way, so classifying it as model-forbidden benched ONE model per attempt:
+// with 93 catalog rows on that platform, each request burned its whole failover
+// budget re-discovering the same dead account. Not key-auth either: the
+// credential itself is valid, the plan behind it is not, and validateKey's
+// /models probe still passes, so the health checker never demotes the key.
+// Status-gated to 403 (or a status-less message that names one) so provider
+// wording alone can never condemn a healthy key.
+export function isAccountSuspendedError(err: any): boolean {
+  const status = typeof err?.status === 'number' ? err.status : 0;
+  const msg = (err?.message ?? '').toLowerCase();
+  if (status !== 403 && !(status === 0 && msg.includes('403'))) return false;
+  return /\b(plan|account|subscription) (is|has been|was) (temporarily )?(disabled|suspended|banned|deactivated)\b/.test(msg)
+    || msg.includes('due to abuse');
 }
 
 // A 403 Forbidden returned for a specific model behind an otherwise-valid key.
@@ -604,4 +736,29 @@ export function modelRetirementSignal(err: any): ModelRetirementConfidence | nul
   if (gone || (isModelNotFoundError(err) && END_OF_LIFE_PHRASES.some(phrase => msg.includes(phrase)))) return 'definitive';
   if (!isModelNotFoundError(err)) return null;
   return MODEL_GONE_PHRASES.some(phrase => msg.includes(phrase)) ? 'probable' : null;
+}
+
+// A stream that ended without its terminal marker (`[DONE]` and/or a
+// finish_reason): the upstream connection was reset or the response truncated
+// mid-generation. Observed live on Kilo Gateway (5 attempts in one session,
+// #1218): the gateway answers 200, streams content, then dies without
+// `data: [DONE]` — `readSseStream` throws
+// "…stream ended unexpectedly (no [DONE], no finish_reason)".
+//
+// The truncation is UPSTREAM transport, not request shape, so the plain
+// retryable path (a fresh attempt on a sibling key, or even the same key
+// later) is the right response — but a stream that dies with zero content
+// deltas is usually the ROUTE (platform+model+key edge) that is sick, not
+// bad luck: three empty-ended truncations in a row on the same route
+// reliably precede another one. Callers use this signal to bench the route
+// after a short streak instead of re-paying the round trip every request.
+export function isStreamTruncatedError(err: any): boolean {
+  const msg = (err?.message ?? '').toLowerCase();
+  return msg.includes('stream ended unexpectedly')
+    || msg.includes('no [done], no finish_reason')
+    // undici surfaces an abrupt RST as "terminated" on the body read; with
+    // our SSE reader the top-level message is "terminated" and the real
+    // cause is buried in err.cause (see isTransportError). Count it too:
+    // a terminated mid-stream body is the same dead route either way.
+    || msg === 'terminated';
 }

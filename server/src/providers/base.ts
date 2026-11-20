@@ -19,6 +19,9 @@ import { extractThinkTagsFromStream } from '../lib/think-tags.js';
 export interface ProviderHttpError extends Error {
   status?: number;
   retryAfterMs?: number;
+  providerRejection?: 'upstream' | 'request' | 'model';
+  /** Explicit daily-window violation from structured upstream quota details. */
+  dailyQuotaExhausted?: boolean;
 }
 
 /** Upper bound on a provider-supplied back-off. A malformed or hostile
@@ -45,10 +48,12 @@ export function parseRetryAfterMs(value: string | null | undefined): number | un
  *  digits, an optional fraction, then a literal `s` ("17s", "1.5s", "0.25s"). */
 const PROTOBUF_DURATION = /^(\d+(?:\.\d+)?)s$/;
 
-/** "Please try again in 7.66s" / "retry after 30 seconds" / "try again in 2m".
- *  Anchored on an explicit retry phrase so an unrelated number in an error
- *  message can never be mistaken for a back-off. */
-const PROSE_RETRY = /(?:try again|retry)\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hour|hours)\b/i;
+/** "Please try again in 7.66s" / "retry after 30 seconds" / "try again in 2m",
+ *  and compound Go-style durations like Groq's "try again in 1m26s" or
+ *  "6m0.512s". Anchored on an explicit retry phrase so an unrelated number in
+ *  an error message can never be mistaken for a back-off. */
+const PROSE_RETRY = /(?:try again|retry)\s+(?:in|after)\s+(\d+(?:\.\d+)?\s*[a-z]+(?:\s*\d+(?:\.\d+)?\s*[a-z]+)*)/i;
+const DURATION_PART = /(\d+(?:\.\d+)?)\s*([a-z]+)/gi;
 
 const UNIT_MS: Record<string, number> = {
   ms: 1,
@@ -116,8 +121,13 @@ export function parseStatedRetryMs(body: unknown): number | undefined {
   const text = typeof body === 'string' ? body : safeStringify(body);
   const prose = text ? PROSE_RETRY.exec(text) : null;
   if (prose) {
-    const unit = UNIT_MS[prose[2].toLowerCase()];
-    if (unit) return clampRetryMs(Number(prose[1]) * unit);
+    let total: number | undefined;
+    for (const [, amount, unitName] of prose[1].matchAll(DURATION_PART)) {
+      const unit = UNIT_MS[unitName.toLowerCase()];
+      if (!unit) break; // "try again in 5 or so" — stop at the first non-unit word
+      total = (total ?? 0) + Number(amount) * unit;
+    }
+    if (total !== undefined) return clampRetryMs(total);
   }
   return undefined;
 }
@@ -143,9 +153,15 @@ function safeStringify(value: unknown): string {
 export function providerHttpError(res: Response, message: string, body?: unknown): ProviderHttpError {
   const err = new Error(message) as ProviderHttpError;
   err.status = res.status;
+  err.providerRejection = 'upstream';
   const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after')) ?? parseStatedRetryMs(body);
   if (retryAfterMs !== undefined) err.retryAfterMs = retryAfterMs;
   return err;
+}
+
+/** An adapter cannot serve this request or model, though another route may. */
+export function providerRequestError(message: string, kind: 'request' | 'model'): ProviderHttpError {
+  return Object.assign(new Error(message), { status: 400, providerRejection: kind });
 }
 
 // Extended sampling knobs (top_k, seed, penalties, logit_bias, logprobs,
@@ -163,6 +179,9 @@ export interface CompletionOptions extends ExtendedSamplingOptions {
   stream_options?: {
     include_usage?: boolean;
   };
+  /** Remaining context budget (context_window − estimated_input_tokens) for
+   *  this route. resolveMaxTokens clamps max_tokens to fit. */
+  contextBudget?: number;
   /** Per-call HTTP timeout override. Not part of the OpenAI wire format (it is
    * stripped before the request body is built); used by the probe script so
    * NVIDIA's 15-60s serverless cold starts don't read as failures. */
@@ -174,6 +193,19 @@ export interface CompletionOptions extends ExtendedSamplingOptions {
    * finish. Composed with the per-attempt timeout in fetchWithTimeout; never
    * serialized into the request body. */
   signal?: AbortSignal;
+  /**
+   * Anthropic compatibility metadata from a `/v1/messages` caller (#1589):
+   * the request's `safeguards` field and `anthropic-beta` header, carried
+   * with the request through the routing loop so a future Anthropic-native
+   * upstream adapter can forward them. OpenAI-compatible adapters MUST NOT
+   * serialize this into the outbound body — strict upstreams 400 on unknown
+   * top-level fields — so it is kept out of the request payload by
+   * construction (providers build the body from known fields only).
+   */
+  anthropicCompat?: {
+    safeguards?: unknown;
+    anthropicBeta?: string;
+  };
 }
 
 /** Per-call abort/timeout wiring for fetchWithTimeout. */
@@ -223,6 +255,14 @@ export abstract class BaseProvider {
    * on outgoing requests. Defaults to false; set by subclasses. */
   keyless = false;
 
+  /** Whether this built-in platform can serve chat completions (#1741). Search,
+   * speech and decision integrations register so their keys pool and
+   * health-check like every other platform, but their adapters refuse chat.
+   * False lets POST /api/models reject chat registrations up front and keeps
+   * the router from walking a chain entry that can only ever fail. Defaults to
+   * true; overridden by subclasses. */
+  readonly supportsChat: boolean = true;
+
   abstract chatCompletion(
     apiKey: string,
     messages: ChatMessage[],
@@ -242,6 +282,52 @@ export abstract class BaseProvider {
   abstract validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult>;
 
   /**
+   * Optional quota/balance probe (#1403). Providers whose API exposes a
+   * key-info/quota endpoint override this to fetch the provider-reported
+   * limit/remaining and persist them as a `source: 'quota_api'` observation,
+   * so the dashboard shows a real balance instead of a text-label guess.
+   * Must never throw into the caller: the default implementation does no
+   * network at all and returns false; implementations catch transport errors
+   * and return false so a quota probe can never change a health verdict.
+   * Returns true when an observation was recorded.
+   */
+  async fetchQuota(_apiKey: string, _quotaContext?: QuotaObservationContext): Promise<boolean> {
+    return false;
+  }
+
+  /** Whether this provider actually has a quota endpoint to probe (#1403).
+   * fetchQuota alone can't answer it: OpenAICompatProvider overrides the
+   * method for every instance, spec or not. Routes that owe the operator a
+   * "this platform has no quota endpoint" answer must use this instead. */
+  get hasQuotaProbe(): boolean {
+    return false;
+  }
+
+  /** Whether the health checker may probe this provider's keys at all (#1459).
+   * A provider that forbids automated key checks (LLMTR answers any probe with
+   * 403 "automated API key validation tools are not supported", and its
+   * security system suspends accounts that keep sending them) returns false:
+   * the health pass and the cooldown probe then never call validateKey for its
+   * keys, and a key is promoted to healthy by the first request it serves
+   * (markKeyHealthyFromRequest) instead of by a probe. */
+  get supportsKeyValidation(): boolean {
+    return true;
+  }
+
+  /** Whether the scheduled health pass may re-validate this provider's keys
+   * every few minutes (#1599). A provider whose only key check is a malformed
+   * request to its billed endpoint (Exa and keyed Parallel send a search with
+   * no query) returns false: to the provider those requests look like a script
+   * firing empty searches all day. SerpSearch revoked free accounts over them
+   * and now sends no key check at all (supportsKeyValidation === false). The scheduled pass then validates such a key once, when
+   * it has never been checked, re-asks about a key parked at 'error' at most
+   * every NO_POLL_ERROR_REPROBE_MS, and leaves the rest to real traffic. The
+   * cooldown probe never validates it; "Check now" and "Check all" still do. */
+  get supportsKeyPolling(): boolean {
+    return true;
+  }
+
+  /**
    * Turn a conventional 401/403 validation response into a diagnostic result.
    * Providers still return a simple boolean when no useful error body exists,
    * but preserving the upstream message here lets the health service persist
@@ -249,6 +335,12 @@ export abstract class BaseProvider {
    */
   protected async validationResult(res: Response): Promise<KeyValidationResult> {
     if (res.status !== 401 && res.status !== 403) return true;
+    // A Cloudflare bot challenge ("Just a moment...") is a 403 about the
+    // caller's IP and User-Agent, not about the key. Surface it as
+    // inconclusive so health never auto-disables a good key behind it (#1298).
+    if (res.headers?.get('cf-mitigated') === 'challenge') {
+      throw providerHttpError(res, `${this.name} key validation blocked by a Cloudflare challenge (HTTP ${res.status}); the key was not checked`);
+    }
 
     let body: any = null;
     try {

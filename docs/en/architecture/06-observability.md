@@ -49,7 +49,7 @@ On first ingest (or explicit `initServerLogs()` call):
 
 ### Querying & Maintenance
 
-The public query API (`queryLogs({ levels, q, provider, sinceId, limit })`), level-count badges (`levelCounts()`), and clear/reset behavior (`clearLogs()`, `resetServerLogsForTest()`) are specified in the [Server Logs Viewer API contract](../logs/01-server-logs-viewer.md#api-contract). The ID counter is preserved across `clearLogs()` so a dashboard cursor never sees duplicate ids.
+The public query API (`queryLogs({ levels, q, provider, event, sinceId, limit })`), level-count badges (`levelCounts()`), and clear/reset behavior (`clearLogs()`, `resetServerLogsForTest()`) are specified in the [Server Logs Viewer API contract](../logs/01-server-logs-viewer.md#api-contract). The ID counter is preserved across `clearLogs()` so a dashboard cursor never sees duplicate ids.
 
 ### Desktop file logger
 
@@ -87,9 +87,13 @@ the cache. Streamed frames omit it (the header carries it there).
 
 `requests.caller` records the surface: today every inference path writes `http`
 (the OpenAI-compatible proxy, `/v1/responses`, `/v1/messages`, the Ollama and
-Gemini wires, and fusion sub-calls). `/mcp` is introspection-only and runs no
-inference, and the dashboard playground calls the same HTTP endpoints as any
-other client. The column is free-form, so a new surface needs no migration.
+Gemini wires, fusion sub-calls, and `ask_freellmapi`). The MCP inference tool
+deliberately loops through the same local `/v1/chat/completions` route, so it
+inherits identical routing, fallback, cache, token accounting, and error
+handling instead of maintaining a second inference implementation. The other
+`/mcp` tools are local introspection/control calls. The dashboard playground
+also calls the same HTTP endpoints as any other client. The column is free-form,
+so a new surface needs no migration.
 
 ### Attempt Trail (`request_attempts` table)
 

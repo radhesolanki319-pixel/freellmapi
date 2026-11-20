@@ -12,6 +12,8 @@ import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getUnifiedApiKey } from '../../db/index.js';
 import { mintDashboardToken } from '../helpers/auth.js';
+import { clearReasoningMemory } from '../../routes/proxy.js';
+import { _clearStoreForTesting as clearHandoffStore } from '../../services/context-handoff.js';
 
 let dashToken = '';
 
@@ -19,7 +21,7 @@ async function request(
   app: Express,
   method: string,
   path: string,
-  opts: { body?: unknown; token?: string } = {},
+  opts: { body?: unknown; token?: string; headers?: Record<string, string> } = {},
 ) {
   const server = app.listen(0, '127.0.0.1');
   if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
@@ -29,6 +31,7 @@ async function request(
     headers: {
       ...(opts.body ? { 'Content-Type': 'application/json' } : {}),
       ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
+      ...opts.headers,
     },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
@@ -235,6 +238,186 @@ describe('client profiles (#411)', () => {
       const sent = seenMessages[0];
       expect(sent[0]).toMatchObject({ role: 'system', content: 'ENFORCED PROMPT' });
       expect(sent[1]).toMatchObject({ role: 'system', content: 'caller instructions' });
+    });
+  });
+
+  describe('the Anthropic surface (/v1/messages) honors profile keys', () => {
+    const anthropicBody = {
+      model: 'auto',
+      max_tokens: 64,
+      system: 'caller instructions',
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+
+    it('accepts a profile key on x-api-key and injects the enforced prompt first', async () => {
+      const created = await createProfile('anthropic-bot', 'ENFORCED PROMPT');
+      const { status } = await request(app, 'POST', '/v1/messages', {
+        token: created.key, body: anthropicBody,
+      });
+      expect(status).toBe(200);
+      const sent = seenMessages[0];
+      // Same ordering contract as /v1/chat/completions: enforced first, the
+      // caller's system turn survives after it.
+      expect(sent[0]).toMatchObject({ role: 'system', content: 'ENFORCED PROMPT' });
+      expect(sent.some(m => m.role === 'system' && m.content === 'caller instructions')).toBe(true);
+    });
+
+    it('the unified key injects nothing on /v1/messages', async () => {
+      const { status } = await request(app, 'POST', '/v1/messages', {
+        token: unifiedKey, body: anthropicBody,
+      });
+      expect(status).toBe(200);
+      expect(seenMessages[0][0]).toMatchObject({ role: 'system', content: 'caller instructions' });
+    });
+
+    it('a disabled profile key gets 401 on /v1/messages too', async () => {
+      const created = await createProfile('anthropic-off', 'x');
+      await request(app, 'PATCH', `/api/client-profiles/${created.id}`, {
+        token: dashToken, body: { enabled: false },
+      });
+      const { status } = await request(app, 'POST', '/v1/messages', {
+        token: created.key, body: anthropicBody,
+      });
+      expect(status).toBe(401);
+    });
+  });
+
+  describe('the Gemini surface (/v1beta) honors profile keys', () => {
+    const geminiBody = {
+      contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+      systemInstruction: { parts: [{ text: 'caller instructions' }] },
+    };
+    const geminiPath = '/v1beta/models/gemini-2.5-flash:generateContent';
+
+    it('accepts a profile key and injects the enforced prompt first', async () => {
+      const created = await createProfile('gemini-bot', 'ENFORCED PROMPT');
+      const { status } = await request(app, 'POST', geminiPath, {
+        token: created.key, body: geminiBody,
+      });
+      expect(status).toBe(200);
+      const sent = seenMessages[0];
+      expect(sent[0]).toMatchObject({ role: 'system', content: 'ENFORCED PROMPT' });
+      expect(sent.some(m => m.role === 'system' && m.content === 'caller instructions')).toBe(true);
+    });
+
+    it('a disabled profile key gets 401 on /v1beta too', async () => {
+      const created = await createProfile('gemini-off', 'x');
+      await request(app, 'PATCH', `/api/client-profiles/${created.id}`, {
+        token: dashToken, body: { enabled: false },
+      });
+      const { status } = await request(app, 'POST', geminiPath, {
+        token: created.key, body: geminiBody,
+      });
+      expect(status).toBe(401);
+    });
+  });
+
+  // #1890: per-session memory that is replayed into a later request must stay
+  // with the credential that produced it. Two callers collide on the session
+  // key whenever they open with the same text or send the same x-session-id.
+  describe('per-session memory is scoped to the calling key (#1890)', () => {
+    const opening = { role: 'user', content: 'hello' };
+    const followUp = [opening, { role: 'assistant', content: 'hi there' }, { role: 'user', content: 'go on' }];
+
+    // A fake upstream that thinks: every answer carries a reasoning trace that
+    // names the turn, so a replayed trace shows where it came from.
+    function thinkingRoute(modelId = 'fake-model') {
+      return {
+        provider: {
+          name: 'fake',
+          async chatCompletion(_apiKey: string, messages: any[]) {
+            seenMessages.push(messages);
+            return {
+              id: 'c', object: 'chat.completion', created: 0, model: modelId,
+              choices: [{
+                index: 0,
+                message: { role: 'assistant', content: 'hi there', reasoning_content: `trace of call ${seenMessages.length}` },
+                finish_reason: 'stop',
+              }],
+              usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+            };
+          },
+        },
+        modelId, modelDbId: 9999, apiKey: 'k', keyId: 1, platform: 'fake', displayName: 'Fake Model',
+      };
+    }
+
+    function replayedAssistant(call: number) {
+      return seenMessages[call].find((m: any) => m.role === 'assistant');
+    }
+
+    beforeEach(() => {
+      clearReasoningMemory();
+      clearHandoffStore();
+      mockRouteRequest.mockImplementation(() => thinkingRoute());
+    });
+
+    it('does not replay one profile\'s reasoning trace into another profile\'s request', async () => {
+      const a = await createProfile('memory-a');
+      const b = await createProfile('memory-b');
+
+      expect((await request(app, 'POST', '/v1/chat/completions', { token: a.key, body: { messages: [opening] } })).status).toBe(200);
+      expect((await request(app, 'POST', '/v1/chat/completions', { token: b.key, body: { messages: followUp } })).status).toBe(200);
+
+      expect(replayedAssistant(1)).toEqual({ role: 'assistant', content: 'hi there' });
+    });
+
+    it('still replays a profile\'s own trace on its next turn', async () => {
+      const a = await createProfile('memory-own');
+
+      await request(app, 'POST', '/v1/chat/completions', { token: a.key, body: { messages: [opening] } });
+      await request(app, 'POST', '/v1/chat/completions', { token: a.key, body: { messages: followUp } });
+
+      expect(replayedAssistant(1)).toMatchObject({ reasoning_content: 'trace of call 1' });
+    });
+
+    it('keeps the unified key and a profile key apart in both directions', async () => {
+      const a = await createProfile('memory-vs-unified');
+
+      await request(app, 'POST', '/v1/chat/completions', { token: unifiedKey, body: { messages: [opening] } });
+      await request(app, 'POST', '/v1/chat/completions', { token: a.key, body: { messages: followUp } });
+      expect(replayedAssistant(1)).toEqual({ role: 'assistant', content: 'hi there' });
+
+      clearReasoningMemory();
+      seenMessages.length = 0;
+      await request(app, 'POST', '/v1/chat/completions', { token: a.key, body: { messages: [opening] } });
+      await request(app, 'POST', '/v1/chat/completions', { token: unifiedKey, body: { messages: followUp } });
+      expect(replayedAssistant(1)).toEqual({ role: 'assistant', content: 'hi there' });
+    });
+
+    it('does not share memory between profiles that send the same x-session-id', async () => {
+      const a = await createProfile('memory-hdr-a');
+      const b = await createProfile('memory-hdr-b');
+      const headers = { 'x-session-id': 'shared-session' };
+
+      await request(app, 'POST', '/v1/chat/completions', {
+        token: a.key, headers, body: { messages: [{ role: 'user', content: 'opening of A' }] },
+      });
+      await request(app, 'POST', '/v1/chat/completions', {
+        token: b.key, headers,
+        body: { messages: [{ role: 'user', content: 'opening of B' }, { role: 'assistant', content: 'hi there' }, { role: 'user', content: 'go on' }] },
+      });
+
+      expect(replayedAssistant(1)).toEqual({ role: 'assistant', content: 'hi there' });
+    });
+
+    it('does not hand off another profile\'s session when the model changes', async () => {
+      process.env.FREELLMAPI_CONTEXT_HANDOFF = 'on_model_switch';
+      try {
+        const a = await createProfile('handoff-a');
+        const b = await createProfile('handoff-b');
+
+        mockRouteRequest.mockImplementation(() => thinkingRoute('model-of-a'));
+        await request(app, 'POST', '/v1/chat/completions', { token: a.key, body: { messages: [opening] } });
+
+        mockRouteRequest.mockImplementation(() => thinkingRoute('model-of-b'));
+        await request(app, 'POST', '/v1/chat/completions', { token: b.key, body: { messages: followUp } });
+
+        const handoff = seenMessages[1].find((m: any) => m.role === 'system' && String(m.content).startsWith('FreeLLMAPI context handoff:'));
+        expect(handoff).toBeUndefined();
+      } finally {
+        delete process.env.FREELLMAPI_CONTEXT_HANDOFF;
+      }
     });
   });
 });

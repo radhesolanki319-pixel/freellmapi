@@ -1,13 +1,15 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { invalidateSearchQueries } from '@/lib/search'
 import { Button } from '@/components/ui/button'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { PageHeader } from '@/components/page-header'
 import type { ApiKey, Platform } from '../../../shared/types'
 import { Plus, Download } from 'lucide-react'
 import { useI18n } from '@/i18n'
-import type { HealthData } from '@/components/keys/shared'
+import { LISTED_PLATFORMS, type HealthData } from '@/components/keys/shared'
 import { QuotaSignalsSection } from '@/components/keys/quota-signals-section'
 import { UnifiedKeySection } from '@/components/keys/unified-key-section'
 import { ClientProfilesSection } from '@/components/keys/client-profiles-section'
@@ -16,6 +18,7 @@ import { BackupsSection } from '@/components/keys/backups-section'
 import { AnthropicSection } from '@/components/keys/anthropic-section'
 import { ProviderList } from '@/components/keys/provider-list'
 import { ProviderChecklistSection } from '@/components/keys/provider-checklist-section'
+import { KeylessNotice } from '@/components/keys/keyless-notice'
 import { AddKeyDialog } from '@/components/keys/add-key-dialog'
 import { ExportKeysDialog } from '@/components/keys/export-keys-dialog'
 import { AgentCompatibilitySection } from '@/components/keys/agent-compatibility-section'
@@ -33,10 +36,19 @@ export default function KeysPage() {
   const { t } = useI18n()
   const queryClient = useQueryClient()
   const [tab, setTab] = useState<KeysTab>('providers')
-  const [addOpen, setAddOpen] = useState(false)
+  // `/keys?add=<platform>` opens Add key preselected to that provider, so other
+  // pages can send the user straight to the one key they need (e.g. the
+  // Decision routing setup guide, #1354). Unknown values are ignored.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const linkedPlatform = LISTED_PLATFORMS.find(p => p.value === searchParams.get('add'))?.value
+  const [addOpen, setAddOpen] = useState(linkedPlatform !== undefined)
   // Provider the Add key dialog opens preselected to, when the add flow was
-  // entered from a checklist chip rather than the generic Add key button.
-  const [addPlatform, setAddPlatform] = useState<Platform | ''>('')
+  // entered from a checklist chip (or a link) rather than the generic Add key button.
+  const [addPlatform, setAddPlatform] = useState<Platform | ''>(linkedPlatform ?? '')
+  // Drop the param once read, so closing the dialog and reloading does not reopen it.
+  useEffect(() => {
+    if (searchParams.has('add')) setSearchParams(prev => { prev.delete('add'); return prev }, { replace: true })
+  }, [searchParams, setSearchParams])
   const [exportOpen, setExportOpen] = useState(false)
 
   const openAddKey = (platform: Platform | '' = '') => {
@@ -62,6 +74,7 @@ export default function KeysPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['health'] })
       queryClient.invalidateQueries({ queryKey: ['keys'] })
+      invalidateSearchQueries(queryClient)
     },
   })
 
@@ -94,6 +107,7 @@ export default function KeysPage() {
               onValueChange={setTab}
               options={KEYS_TABS.map(tb => ({ value: tb.id, label: t(tb.labelKey) }))}
               ariaLabel={t('keys.pageTitle')}
+              className="w-full sm:w-auto"
             />
           </>
         }
@@ -113,12 +127,15 @@ export default function KeysPage() {
         {tab === 'agents' && <AgentCompatibilitySection />}
 
         {tab === 'quotaSignals' && (
-          <QuotaSignalsSection states={(healthData?.quotaStates ?? []).slice(0, 24)} />
+          <QuotaSignalsSection states={healthData?.quotaStates ?? []} />
         )}
 
         {tab === 'providers' && (
           <>
-            <ProviderChecklistSection onAddKey={platform => openAddKey(platform as Platform)} />
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <ProviderChecklistSection onAddKey={platform => openAddKey(platform as Platform)} />
+              <KeylessNotice />
+            </div>
             <ProviderList onAddKey={() => openAddKey()} />
           </>
         )}

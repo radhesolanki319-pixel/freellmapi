@@ -15,19 +15,21 @@ Of the 43 built-in platforms, **10 use dedicated adapters** and **33 ride `OpenA
 | Platform | Display name | Auth | Adapter | Notes |
 | --- | --- | --- | --- | --- |
 | `google` | Google Gemini | Keyed | Native (`GoogleProvider`) | Gemini wire format; 60s default timeout because Gemma reasoning variants take 20–60s on cold start. |
-| `groq` | Groq | Keyed | OpenAI-compat | Standard compatible endpoint at `api.groq.com/openai/v1`. |
+| `groq` | Groq | Keyed | OpenAI-compat | Standard compatible endpoint at `api.groq.com/openai/v1`; [Orpheus speech](09-groq-speech.md) uses the same key. |
 | `cerebras` | Cerebras | Keyed | OpenAI-compat | `api.cerebras.ai/v1`. |
+| `zro` | Zro (MoonMath.ai) | Keyed | OpenAI-compat subclass | Selected routes share daily free usage, not monthly cash credits; no numeric quota inferred. Authenticated read-only key validation, documented alias identity checks, and hosted-catalog-only rows. [Setup and funding](zro.md). |
 | `electronhub` | ElectronHub | Keyed | OpenAI-compat subclass | Shared weekly credit pool; validates against `/v1/user/me`, rejects HTTP-200 proxy-error banners. [Funding and integration notes](04-recurring-credit-gateways.md). |
 | `experiential` | Experiential Labs | Keyed | OpenAI-compat subclass | Shared monthly credit pool; authenticated `/v1/models`, model-specific Claude sampling compatibility. [Funding and account-verification notes](04-recurring-credit-gateways.md). |
 | `sail` | Sail Research | Keyed (payment method required for recurring credit) | Native (`SailProvider`) | Stable `/v1/responses` integration submits background jobs and polls them to completion; flex-only models use the `flex` completion window. Sail grants $5 in monthly credits while a payment method is attached, then charges usage beyond that credit. |
 | `bai` | B.AI | Keyed | OpenAI-compat | Gateway added in #918; only catalog row is a limited-time 0-credit promo, kept in the hosted catalog. |
 | `anyapi` | AnyAPI | Keyed | OpenAI-compat | Free tier $0/no card/recurring, capped at 100K tokens/day over "free and basic" models; no RPM/RPD published (#772). Model ids arrive via catalog-sync, never seeded blind. |
+| `powertokens` | PowerTokens | Keyed | OpenAI-compat | Free model `glm-4.7-flash` ($0 / 1M in+out, 0 Credits on the Models UI); re-tested 2026-11-10 (chat + streaming 200 in ~3s). Upstream answers load with 429 code `1305`, handled by the normal cooldown. Keys restricted to other models return 403 `token_model_forbidden`. Catalog-only rows (RPM/RPD unpublished): premium now, free after 30 days. |
+| `cheapllm` | cheapllm.shop | Keyed | OpenAI-compat | One model, `deepseek-v4.1-flash-1017`. Free with no rate limit during the beta, then a permanent free tier of at least 5,000 input + 1,000 output tokens per hour per account; no card ([source](https://cheapllm.shop/docs#free-tier), 2026-11-10). Queues instead of answering 429; 180s timeout. Catalog-only rows. |
 | `radeon` | AMD Radeon Cloud TokenFactory | Keyed | OpenAI-compat | Shared Model API at `developer.amd.com.cn/radeon/api/v1`; public models are free without consuming instance credits and use a rotating experimental roster. Current per-account limits are read from response headers rather than hard-coded. Parallel tool calls are disabled and the adapter allows the documented ten-minute generation window. |
 | `nvidia` | NVIDIA NIM | Keyed | OpenAI-compat | `parallel_tool_calls` pinned false (#255); 180s timeout doubles as streaming first-byte grace (#584). |
 | `mistral` | Mistral | Keyed | OpenAI-compat | `api.mistral.ai/v1`. |
 | `sambanova` | SambaNova | Retired (V23) | Not registered | Free tier permanently gone; kept in the type union for historical key rows. |
 | `openrouter` | OpenRouter | Keyed | OpenAI-compat | Sends `HTTP-Referer`/`X-Title` headers; `:free` model suffix marks zero-cost routes. |
-| `github` | GitHub Models | Keyed | OpenAI-compat | Routes to `models.github.ai/inference`; catalog uses `<publisher>/<model>` ids. |
 | `cohere` | Cohere | Keyed | Native (`CohereProvider`) | Uses Cohere's OpenAI-compatible endpoint. |
 | `cloudflare` | Cloudflare Workers AI | Keyed (`account_id:token`) | Native (`CloudflareProvider`) | Compound credential format parsed by the adapter. |
 | `zhipu` | Zhipu (Z.ai / bigmodel.cn) | Keyed | Native (`ZhipuProvider`) | Console autodetect: a rejected domestic key is re-probed against the global `api.z.ai` host; 60s timeout covers glm-4.7-flash hidden reasoning. |
@@ -36,16 +38,16 @@ Of the 43 built-in platforms, **10 use dedicated adapters** and **33 ride `OpenA
 | `pollinations` | Pollinations | Keyed | Native (`PollinationsProvider`) | `GET /v1/models` answers 200 even for revoked keys, so validation probes the authenticated `/account/key` instead (#608). |
 | `llm7` | LLM7.io | Keyed (anonymous works for basic models) | OpenAI-compat | 100 req/hr free tier. |
 | `huggingface` | Hugging Face Router | Keyed | OpenAI-compat | `router.huggingface.co` meta-router (re-added V13); recurring $0.10/mo router credit on the free tier. |
-| `opencode` | OpenCode Zen | Keyed | OpenAI-compat | Trial-only promotional free roster, docs-confirmed ids seeded via `migrateModelsV18`. |
+| `opencode` | OpenCode Zen | Keyed | OpenAI-compat | Free roster is locked to the OpenCode client since 2026-09 (403 FreeTierError, #1249) and disabled in the catalog; paid models only. |
 | `ovh` | OVHcloud AI Endpoints | Keyless | OpenAI-compat | Anonymous tier: 2 req/min per IP per model (observed stricter); authenticated tier requires a Public Cloud project with payment method on file (`migrateModelsV26`). |
 | `agnes` | Agnes AI | Keyed | OpenAI-compat | Proprietary models served at $0/token promotionally; ~30 concurrent requests before 429s; 60s timeout for reasoning TTFB. |
-| `reka` | Reka | Keyed | OpenAI-compat | Free via recurring monthly credit grant (no card); balance dashboard-only. |
+| `reka` | Reka | Keyed | OpenAI-compat | No free tier for new accounts since 2026-09: prepaid credits required (#1202). Accounts that still hold credit keep working; balance dashboard-only. |
 | `siliconflow` | SiliconFlow | Keyed | OpenAI-compat | Registered mainly for FREE generative-media models (FLUX.1-schnell image, CosyVoice2 TTS) routed via `services/media.ts`. |
 | `routeway` | Routeway | Keyed | OpenAI-compat | Requires browser-style User-Agent (Cloudflare rejects others with error 1010); free pool observed stricter (~5 rpm) than the documented 20 rpm / 200 rpd. |
 | `bazaarlink` | BazaarLink | Keyed | OpenAI-compat | Only the `auto:free` route is cataloged — direct model ids are paid (#385). |
 | `ainative` | AINative Studio | Keyed | OpenAI-compat | Advertises recurring ~10M tokens/month free allocation; quota treated as unverified until confirmed by a real account. |
 | `aion` | Aion Labs | Keyed | OpenAI-compat | No-card free key; availability catalog-managed behind the 30-day age gate. |
-| `requesty` | Requesty | Keyed | OpenAI-compat | Router endpoint at `router.requesty.ai/v1`; free rows age into the monthly catalog. |
+| `requesty` | Requesty | Keyed | OpenAI-compat | Router endpoint at `router.requesty.ai/v1`; free rows age into the monthly catalog; the free tier is 200 requests/day shared across all free models. |
 | `navy` | NavyAI | Keyed | OpenAI-compat | Free plan: 150K tokens/day and 20 RPM; live smoke tests require an explicit User-Agent header. |
 | `nara` | NaraRouter | Keyed | OpenAI-compat | Free plan additionally requires Telegram channel/link verification; live-probed 2026-07-09. |
 | `sealion` | SEA-LION (AI Singapore) | Keyed | OpenAI-compat | First-party API; Google sign-in, no card, no region wall; 10 RPM recurring free tier. |
@@ -59,6 +61,14 @@ Of the 43 built-in platforms, **10 use dedicated adapters** and **33 ride `OpenA
 | `xfyun` | iFlytek Spark | Keyed | OpenAI-compat | Auth is the console APIPassword as a Bearer token; the Lite model is the documented free one; no published token/QPS ceiling (#936). |
 | `aihorde` | AI Horde | Keyless (anonymous sentinel `0000000000`; registered key raises queue priority) | Native (`AIHordeProvider`) | Community volunteer workers via queue-based proxy: max_tokens >= 16, stop must be array, no tools, usage reported as kudos, 120s timeout, no upstream streaming (#345). |
 | `custom` | Custom (OpenAI-compatible) | User-supplied base URL stored per `api_keys` row | OpenAI-compat built per key via `resolveProvider()` | Registered placeholder keeps `getProvider('custom')`/`hasProvider('custom')` well-behaved; 120s timeout for slow local runtimes (llama.cpp, vLLM, LM Studio) (#145). |
+
+## Custom endpoint groups
+
+Custom endpoints can be filed under a **group** you name (#1176): set it in the **Group** field when adding an endpoint, or later from **Edit key**. The group belongs to the endpoint, so every key in that endpoint's pool moves with it, and a key added later joins the same group. Blank means the default **Custom (OpenAI-compatible)** group.
+
+- **Keys page** – each group gets its own section with a `#handle` badge (the label slugified: `Work relays` → `#work-relays`). The section's switch turns on or off only that group's endpoints.
+- **Requests** – add the handle after a model id to keep a request inside the group: `custom:deepseek-v3.1#work-relays` (or `deepseek-v3.1#work-relays`) routes and fails over only across the group's endpoints that serve that model. An endpoint's own handle (`custom:deepseek-v3.1#relay-a.example.com-v1`) still pins a single endpoint and wins if a group has the same name.
+- **API** – `GET /api/keys` returns `groupLabel`; `PATCH /api/keys/:id` and `POST /api/keys/custom` accept `groupLabel` (`""` clears it); `PATCH /api/keys/platform/custom` accepts `group` (a label, or `null` for the ungrouped endpoints) to narrow the on/off sweep.
 
 ## Related history
 

@@ -126,6 +126,26 @@ describe('Response cache (proxy integration)', () => {
       ...extra,
     }, { ...authHeaders(), ...headers });
 
+  it.each([
+    { response_format: { type: 'json_object' } },
+    { seed: 42 },
+    { stop: 'END' },
+    { parallel_tool_calls: false },
+  ])('rejects idempotent retries with changed generation options: %j', async (extra) => {
+    getDb().prepare('DELETE FROM idempotency_claims').run();
+    const counter = mockGroq('plain text');
+    const headers = { 'Idempotency-Key': 'generation-options', 'X-FreeLLM-Cache': 'off' };
+    const first = await chat({}, headers);
+    expect(first.status).toBe(200);
+    const replay = await chat({}, headers);
+    expect(replay.status).toBe(200);
+    expect(replay.headers.get('x-routed-via')).toBe('idempotency');
+    const second = await chat(extra, headers);
+    expect(second.status).toBe(409);
+    expect(second.body.error.message).toBe('idempotency_key_conflict');
+    expect(counter.calls).toBe(1);
+  });
+
   it('serves an identical second request from cache without calling the provider', async () => {
     const counter = mockGroq('the answer is four');
 
@@ -178,6 +198,20 @@ describe('Response cache (proxy integration)', () => {
     const repeat = await chat({ seed: 42 });
     expect(repeat.headers.get('x-freellm-cache')).toBe('HIT');
     expect(counter.calls).toBe(4);
+  });
+
+  it('requests differing only in top_k, min_p, repetition_penalty, or parallel_tool_calls never collide', async () => {
+    const counter = mockGroq('sampler-sensitive');
+    await chat(); // plain → MISS, populates
+    const topK = await chat({ top_k: 1 });
+    expect(topK.headers.get('x-freellm-cache')).toBe('MISS');
+    await chat({ min_p: 0.2 });
+    await chat({ repetition_penalty: 1.3 });
+    await chat({ parallel_tool_calls: false });
+    expect(counter.calls).toBe(5);
+    const repeat = await chat({ top_k: 1 });
+    expect(repeat.headers.get('x-freellm-cache')).toBe('HIT');
+    expect(counter.calls).toBe(5);
   });
 
   it('X-FreeLLM-Cache: off bypasses the cache on both read and write', async () => {

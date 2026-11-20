@@ -64,6 +64,12 @@ vi.mock('../../../server/src/services/cooldown-probe.js', () => ({
   }),
 }));
 
+vi.mock('../../../server/src/services/model-probe.js', () => ({
+  startModelProbe: vi.fn(() => {
+    calls.push('startModelProbe');
+  }),
+}));
+
 vi.mock('../../../server/src/services/backups.js', () => ({
   startBackupScheduler: vi.fn(() => {
     calls.push('startBackupScheduler');
@@ -74,6 +80,13 @@ vi.mock('../../../server/src/services/backups.js', () => ({
 vi.mock('../../../server/src/services/custom-model-sync.js', () => ({
   startCustomModelSync: vi.fn(() => {
     calls.push('startCustomModelSync');
+    return null;
+  }),
+}));
+
+vi.mock('../../../server/src/services/builtin-model-discovery.js', () => ({
+  startBuiltinModelDiscovery: vi.fn(() => {
+    calls.push('startBuiltinModelDiscovery');
     return null;
   }),
 }));
@@ -167,8 +180,10 @@ describe('desktop server boot sequence (#949)', () => {
       'startHealthChecker',
       'startCatalogSync',
       'startCooldownProbe',
+      'startModelProbe',
       'startBackupScheduler',
       'startCustomModelSync',
+      'startBuiltinModelDiscovery',
       'startWakeDetect',
     ]);
   });
@@ -192,8 +207,11 @@ describe('desktop server boot sequence (#949)', () => {
     // Env-gated (FREEAPI_DB_BACKUP_*): a GUI-launched packaged app inherits no
     // shell environment, so these can never activate on desktop. loadConfig()
     // is the same story: port/host/dbPath arrive as StartOptions here, not from
-    // the environment it would read.
-    const SKIPPED = new Set(['restoreDbBackupIfNeeded', 'startDbBackupPump', 'loadConfig']);
+    // the environment it would read. installGracefulShutdown exists because a
+    // container's PID 1 ignores SIGTERM; in the desktop app Electron owns the
+    // process lifecycle (quit, relaunch, the updater's quitAndInstall), and
+    // SIGTERM/SIGINT handlers there would race it.
+    const SKIPPED = new Set(['restoreDbBackupIfNeeded', 'startDbBackupPump', 'loadConfig', 'installGracefulShutdown']);
     // Regex sanity floor — an index.ts restructure must not blank this test.
     expect(steps.size).toBeGreaterThanOrEqual(10);
 

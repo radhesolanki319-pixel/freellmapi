@@ -10,6 +10,7 @@ import { isUnifyEnabled, setUnifyEnabled, getUnifyOverrides, setUnifyOverrides, 
 import { getClaudeModelMap, setClaudeModelMap } from '../services/anthropic-map.js';
 import { getGeminiModelMap, setGeminiModelMap } from '../services/gemini-map.js';
 import { getOllamaEmulationMode } from './ollama.js';
+import { MIN_CONTEXT_WINDOW_SETTING, MIN_CONTEXT_WINDOW_PRESETS } from '../lib/min-context-window.js';
 import { UPDATE_CHECK_SETTING, isAutoUpdateCheckEnabled } from './update.js';
 import { listUrlTokens, mintUrlToken, revokeUrlToken } from '../services/url-tokens.js';
 import {
@@ -23,7 +24,7 @@ import {
   getCompressionConfig,
   setCompressionConfig,
 } from '../services/compression/config.js';
-import { getHeadroomThresholds, setHeadroomThresholds, getTaskWeightShare, setTaskWeightShare } from '../services/router.js';
+import { getHeadroomThresholds, setHeadroomThresholds, getTaskWeightShare, setTaskWeightShare, getMinReliabilityFloor, setMinReliabilityFloor, isProviderMomentAttributionEnabled, setProviderMomentAttribution } from '../services/router.js';
 import { MCP_ENABLED_SETTING, isMcpServerEnabled } from './mcp.js';
 import { z } from 'zod';
 import { getAppVersion } from '../lib/app-version.js';
@@ -59,7 +60,7 @@ settingsRouter.put('/update-check', (req: Request, res: Response) => {
   if (!parsed.success) {
     res.status(400).json({
       error: {
-        message: `Invalid update check setting: ${parsed.error.errors.map(error => error.message).join(', ')}`,
+        message: `Invalid update check setting: ${parsed.error.issues.map(error => error.message).join(', ')}`,
         type: 'invalid_request_error',
       },
     });
@@ -76,7 +77,7 @@ settingsRouter.get('/compression', (_req: Request, res: Response) => {
 settingsRouter.put('/compression', (req: Request, res: Response) => {
   const parsed = compressionUpdateSchema.safeParse(req.body);
   if (!parsed.success) {
-    const detail = parsed.error.errors
+    const detail = parsed.error.issues
       .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
       .slice(0, 5)
       .join(', ');
@@ -105,7 +106,7 @@ const unifyPutSchema = z.object({
 settingsRouter.put('/unify', (req: Request, res: Response) => {
   const parsed = unifyPutSchema.safeParse(req.body);
   if (!parsed.success) {
-    const detail = parsed.error.errors.map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ');
+    const detail = parsed.error.issues.map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ');
     res.status(400).json({ error: { message: `Invalid unify settings: ${detail}`, type: 'invalid_request_error' } });
     return;
   }
@@ -124,7 +125,7 @@ settingsRouter.get('/fusion', (_req: Request, res: Response) => {
 settingsRouter.put('/fusion', (req: Request, res: Response) => {
   const parsed = savedFusionConfigSchema.safeParse(req.body);
   if (!parsed.success) {
-    const detail = parsed.error.errors.map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ');
+    const detail = parsed.error.issues.map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ');
     res.status(400).json({ error: { message: `Invalid fusion config: ${detail}`, type: 'invalid_request_error' } });
     return;
   }
@@ -161,13 +162,15 @@ settingsRouter.get('/anthropic-map', (_req: Request, res: Response) => {
 });
 
 // Update the Claude Code model map. Partial: send just the families you want to
-// change; each value is 'auto' or a catalog model_id.
+// change; each value is 'auto', a catalog model_id, or a tier selector
+// (`tier:pro` | `tier:mid` | `tier:normal`) that routes over the whole
+// capability tier instead of one model.
 settingsRouter.put('/anthropic-map', (req: Request, res: Response) => {
   try {
     res.json({ map: setClaudeModelMap(req.body) });
   } catch (err: any) {
-    const detail = err?.errors
-      ? err.errors.map((e: any) => (e.path?.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ')
+    const detail = err?.issues
+      ? err.issues.map((e: any) => (e.path?.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ')
       : (err?.message ?? 'invalid');
     res.status(400).json({ error: { message: `Invalid anthropic model map: ${detail}`, type: 'invalid_request_error' } });
   }
@@ -181,8 +184,8 @@ settingsRouter.put('/gemini-map', (req: Request, res: Response) => {
   try {
     res.json({ map: setGeminiModelMap(req.body) });
   } catch (err: any) {
-    const detail = err?.errors
-      ? err.errors.map((e: any) => (e.path?.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ')
+    const detail = err?.issues
+      ? err.issues.map((e: any) => (e.path?.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ')
       : (err?.message ?? 'invalid');
     res.status(400).json({ error: { message: `Invalid Gemini model map: ${detail}`, type: 'invalid_request_error' } });
   }
@@ -205,7 +208,7 @@ settingsRouter.put('/agent-compatibility', (req: Request, res: Response) => {
   if (!parsed.success) {
     res.status(400).json({
       error: {
-        message: `Invalid agent compatibility settings: ${parsed.error.errors.map(error => error.message).join(', ')}`,
+        message: `Invalid agent compatibility settings: ${parsed.error.issues.map(error => error.message).join(', ')}`,
         type: 'invalid_request_error',
       },
     });
@@ -279,7 +282,7 @@ const outputLimitPutSchema = z.object({
 settingsRouter.put('/output-limit', (req: Request, res: Response) => {
   const parsed = outputLimitPutSchema.safeParse(req.body);
   if (!parsed.success) {
-    const detail = parsed.error.errors
+    const detail = parsed.error.issues
       .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
       .slice(0, 5)
       .join(', ');
@@ -288,6 +291,38 @@ settingsRouter.put('/output-limit', (req: Request, res: Response) => {
   }
   setSetting(UNIFIED_MAX_TOKENS_SETTING, String(parsed.data.mode));
   res.json(outputLimitState());
+});
+
+// Get the min-context-window pool floor ('off' = disabled, or a preset key
+// like '128k'). See lib/min-context-window.ts minContextWindowFloor().
+settingsRouter.get('/min-context-window', (_req: Request, res: Response) => {
+  let value = 'off';
+  try {
+    value = getSetting(MIN_CONTEXT_WINDOW_SETTING) || 'off';
+  } catch {
+    // DB not ready — report the disabled default rather than failing.
+  }
+  res.json({ value, presets: MIN_CONTEXT_WINDOW_PRESETS });
+});
+
+const minContextWindowPutSchema = z.object({
+  value: z.union([
+    z.literal('off'),
+    z.string().regex(/^(32k|128k|512k|1m)$/i),
+  ]),
+});
+
+// Update the min-context-window pool floor. Upward-compatible by construction:
+// '128k' keeps every model at or above 128k (including 512k and 1M). Takes
+// effect on the next routed request — no restart.
+settingsRouter.put('/min-context-window', (req: Request, res: Response) => {
+  const parsed = minContextWindowPutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: "Invalid min context window: value must be 'off', '32k', '128k', '512k', or '1m'", type: 'invalid_request_error' } });
+    return;
+  }
+  setSetting(MIN_CONTEXT_WINDOW_SETTING, parsed.data.value.toLowerCase());
+  res.json({ value: parsed.data.value.toLowerCase(), presets: MIN_CONTEXT_WINDOW_PRESETS });
 });
 
 // Get the request guardrails (per-request token budget + failover circuit
@@ -322,7 +357,7 @@ const headroomPutSchema = z.object({
 settingsRouter.put('/headroom', (req: Request, res: Response) => {
   const parsed = headroomPutSchema.safeParse(req.body);
   if (!parsed.success) {
-    const detail = parsed.error.errors
+    const detail = parsed.error.issues
       .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
       .slice(0, 5)
       .join(', ');
@@ -365,12 +400,64 @@ settingsRouter.put('/task-weight-share', (req: Request, res: Response) => {
   }
 });
 
+// Minimum reliability floor (#filter): drop models whose observed success rate
+// falls below this decimal (0.8 = 80%) from routing. Under-observed models stay
+// in the exploration pool, and the floor never empties the whole chain. null =
+// disabled (the default for existing installs).
+settingsRouter.get('/min-reliability-floor', (_req: Request, res: Response) => {
+  res.json({ floor: getMinReliabilityFloor() ?? null });
+});
+
+const minReliabilityFloorPutSchema = z.object({
+  floor: z.number().min(0).max(1).nullable().optional(),
+});
+
+// Update the minimum reliability floor. null clears back to disabled. Takes
+// effect on the next request — no restart needed.
+settingsRouter.put('/min-reliability-floor', (req: Request, res: Response) => {
+  const parsed = minReliabilityFloorPutSchema.safeParse(req.body);
+  if (!parsed.success || parsed.data.floor === undefined) {
+    res.status(400).json({ error: { message: 'Invalid min-reliability-floor: send {"floor": 0..1 | null}', type: 'invalid_request_error' } });
+    return;
+  }
+  try {
+    setMinReliabilityFloor(parsed.data.floor);
+    res.json({ floor: getMinReliabilityFloor() ?? null });
+  } catch (err: any) {
+    res.status(400).json({ error: { message: `Invalid min-reliability-floor: ${err.message}`, type: 'invalid_request_error' } });
+  }
+});
+
+// Provider-moment failure attribution (opt-in, #1347): tag 429 / 5xx /
+// timeout / transport failures as the provider's bad minute so they steer the
+// key without counting against the model's reliability. Off by default; the
+// ROUTER_PROVIDER_MOMENT_ATTRIBUTION env var pins the behaviour when set.
+settingsRouter.get('/provider-moment-attribution', (_req: Request, res: Response) => {
+  res.json({ enabled: isProviderMomentAttributionEnabled() });
+});
+
+const providerMomentAttributionPutSchema = z.object({
+  enabled: z.boolean(),
+});
+
+// Update the failure-attribution toggle. Takes effect immediately — the
+// setter force-refreshes the stats cache that bakes the filter in.
+settingsRouter.put('/provider-moment-attribution', (req: Request, res: Response) => {
+  const parsed = providerMomentAttributionPutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: 'Invalid provider-moment-attribution: send {"enabled": true|false}', type: 'invalid_request_error' } });
+    return;
+  }
+  setProviderMomentAttribution(parsed.data.enabled);
+  res.json({ enabled: isProviderMomentAttributionEnabled() });
+});
+
 // Update the guardrails. Partial: send just the knob you want to change.
 // Takes effect on the next request — no restart needed. 0 disables a knob.
 settingsRouter.put('/guardrails', (req: Request, res: Response) => {
   const parsed = guardrailsPutSchema.safeParse(req.body);
   if (!parsed.success) {
-    const detail = parsed.error.errors.map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ');
+    const detail = parsed.error.issues.map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ');
     res.status(400).json({ error: { message: `Invalid guardrail settings: ${detail}`, type: 'invalid_request_error' } });
     return;
   }

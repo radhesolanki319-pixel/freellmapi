@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Check, ChevronDown, Layers, Plus, Trash2 } from 'lucide-react'
+import { Check, ChevronDown, Layers, Pencil, Plus, Trash2 } from 'lucide-react'
 import { useI18n } from '@/i18n'
 import { apiFetch, type ApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -38,6 +38,8 @@ export interface Chain {
   is_favorite: number
   sort_order: number
   auto_sort: string | null
+  // Per-chain routing preset (NULL = inherit the global routing_strategy).
+  routing_strategy?: string | null
   layout_config: string | null
   // 0 once the chain opts out of the catalog-sync backfill (#895), which is
   // what an empty-created chain does — it stays exactly as hand-built.
@@ -52,6 +54,13 @@ export function ChainManager() {
   const [startEmpty, setStartEmpty] = useState(true)
   const [createError, setCreateError] = useState('')
   const [collapsed, setCollapsed] = useState<boolean>(readCollapsed)
+  // Inline rename (#1179): one row is editable at a time, like the Playground
+  // conversation list. Renaming is safe mid-flight — routing resolves the name
+  // at request time — but in-flight auto:<old-name> requests fail, so the
+  // confirm step says so.
+  const [renamingId, setRenamingId] = useState<number | null>(null)
+  const [renameDraft, setRenameDraft] = useState('')
+  const [renameError, setRenameError] = useState('')
 
   const { data: chains = [] } = useQuery<Chain[]>({
     queryKey: ['profiles'],
@@ -73,6 +82,18 @@ export function ChainManager() {
     // covers the chain, routing, token-usage and rate-limit queries.
     queryClient.invalidateQueries({ queryKey: ['fallback'] })
   }
+
+  // Per-chain routing preset. PUT is a partial update, so sending only
+  // routing_strategy leaves the rest of the chain alone; null clears it back to
+  // "inherit the global strategy".
+  const setStrategy = useMutation({
+    mutationFn: ({ profileId, strategy }: { profileId: number; strategy: string | null }) =>
+      apiFetch(`/api/profiles/${profileId}`, {
+        method: 'PUT',
+        body: JSON.stringify({ routing_strategy: strategy }),
+      }),
+    onSuccess: () => invalidate(),
+  })
 
   const createChain = useMutation({
     mutationFn: (payload: { name: string; empty: boolean }) =>
@@ -96,6 +117,18 @@ export function ChainManager() {
     mutationFn: (profileId: number) =>
       apiFetch(`/api/profiles/${profileId}`, { method: 'DELETE' }),
     onSuccess: invalidate,
+  })
+  const renameChain = useMutation({
+    mutationFn: ({ profileId, name }: { profileId: number; name: string }) =>
+      apiFetch(`/api/profiles/${profileId}`, { method: 'PUT', body: JSON.stringify({ name }) }),
+    onSuccess: () => {
+      invalidate()
+      setRenamingId(null)
+      setRenameError('')
+    },
+    // Same server rules as create (charset, length, reserved, taken); show
+    // which one fired instead of leaving the row stuck in edit mode.
+    onError: (error: ApiError) => setRenameError(error.message || t('chains.renameFailed')),
   })
 
   if (chains.length === 0) return null
@@ -140,6 +173,43 @@ export function ChainManager() {
             {chains.map(chain => {
               const isActive = chain.id === activeId
               const isProtected = chain.type === 'default' || chain.type === 'builtin'
+              const isRenaming = renamingId === chain.id
+              if (isRenaming) {
+                return (
+                  <form
+                    key={chain.id}
+                    className="flex items-center gap-2 rounded-xl border border-foreground/25 bg-muted/50 px-3 py-2"
+                    onSubmit={e => {
+                      e.preventDefault()
+                      const name = renameDraft.trim()
+                      if (!name || renameChain.isPending) return
+                      if (name !== chain.name
+                        && !window.confirm(t('chains.renameConfirm', { oldName: chain.name, name }))) return
+                      renameChain.mutate({ profileId: chain.id, name })
+                    }}
+                  >
+                    <Input
+                      autoFocus
+                      value={renameDraft}
+                      onChange={e => {
+                        setRenameDraft(e.target.value)
+                        setRenameError('')
+                      }}
+                      onKeyDown={e => { if (e.key === 'Escape') { e.preventDefault(); setRenamingId(null); setRenameError('') } }}
+                      aria-label={t('chains.renamePlaceholder')}
+                      placeholder={t('chains.renamePlaceholder')}
+                      className="h-7 max-w-48 text-sm"
+                    />
+                    <Button type="submit" size="sm" variant="secondary" className="h-7 px-2 text-xs" disabled={!renameDraft.trim() || renameChain.isPending}>
+                      {t('common.save')}
+                    </Button>
+                    <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => { setRenamingId(null); setRenameError('') }}>
+                      {t('common.cancel')}
+                    </Button>
+                    {renameError && <span className="text-xs text-rose-600 dark:text-rose-400">{renameError}</span>}
+                  </form>
+                )
+              }
               return (
                 <div
                   key={chain.id}
@@ -171,6 +241,27 @@ export function ChainManager() {
                       </span>
                     </Tooltip>
                   )}
+                  {/* Rank this chain's own models by its own preset. Rendered
+                      for every chain because a NULL value is itself meaningful
+                      ("inherit"), and the operator needs to see which it is. */}
+                  <select
+                    value={chain.routing_strategy ?? ''}
+                    onChange={e => setStrategy.mutate({
+                      profileId: chain.id,
+                      strategy: e.target.value || null,
+                    })}
+                    disabled={setStrategy.isPending}
+                    title={t('chains.strategyHint')}
+                    aria-label={t('chains.strategy')}
+                    className="h-6 cursor-pointer rounded-md border border-input bg-background px-1 text-[11px] text-muted-foreground disabled:opacity-50"
+                  >
+                    <option value="">{t('chains.strategyInherit')}</option>
+                    <option value="priority">{t('chains.strategyPriority')}</option>
+                    <option value="balanced">{t('chains.strategyBalanced')}</option>
+                    <option value="smartest">{t('chains.strategySmartest')}</option>
+                    <option value="fastest">{t('chains.strategyFastest')}</option>
+                    <option value="reliable">{t('chains.strategyReliable')}</option>
+                  </select>
                   <span className="flex-1" />
                   {!isActive && (
                     <Tooltip text={t('chains.activateHint')}>
@@ -182,6 +273,24 @@ export function ChainManager() {
                         onClick={() => setActive.mutate(chain.id)}
                       >
                         {t('chains.activate')}
+                      </Button>
+                    </Tooltip>
+                  )}
+                  {!isProtected && (
+                    <Tooltip text={t('chains.renameHint')}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 text-xs text-muted-foreground"
+                        aria-label={t('chains.renameHint')}
+                        disabled={renameChain.isPending}
+                        onClick={() => {
+                          setRenamingId(chain.id)
+                          setRenameDraft(chain.name)
+                          setRenameError('')
+                        }}
+                      >
+                        <Pencil className="size-3.5" />
                       </Button>
                     </Tooltip>
                   )}

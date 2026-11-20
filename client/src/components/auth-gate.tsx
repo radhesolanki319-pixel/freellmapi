@@ -5,6 +5,7 @@ import { apiFetch, setToken, UNAUTHORIZED_EVENT, type ApiError } from '@/lib/api
 import { Button } from '@/components/ui/button'
 import { FieldError } from '@/components/ui/field-error'
 import { Input } from '@/components/ui/input'
+import { PasswordInput } from '@/components/ui/password-input'
 import { Label } from '@/components/ui/label'
 import { isEmail } from '@/lib/validate'
 import { useI18n } from '@/i18n'
@@ -30,10 +31,20 @@ function desktopSessionBridge(): (() => Promise<string>) | null {
     : null
 }
 
+// The same dashboard opened in a normal browser tab on a desktop install has no
+// preload bridge, so the server mints the session instead (#1399). It only
+// does so for a request from this computer, and says so through `desktop` on
+// /api/auth/status; web and Docker installs never set it and keep their login.
+async function browserDesktopSession(): Promise<string> {
+  const res = await apiFetch<{ token: string }>('/api/auth/desktop-session', { method: 'POST' })
+  return res.token
+}
+
 interface AuthStatus {
   needsSetup: boolean
   authenticated: boolean
   email: string | null
+  desktop?: boolean
 }
 
 function Centered({ children }: { children: ReactNode }) {
@@ -63,10 +74,13 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
 
   // Inline field feedback; the server stays authoritative. Only the setup form
   // enforces the password minimum client-side (an existing password of any
-  // length must still be able to log in).
+  // length must still be able to log in). The same goes for the email shape:
+  // the desktop app's hidden account is `desktop@localhost` (no TLD), which
+  // the login route accepts on purpose (server/src/routes/auth.ts), so a
+  // browser tab must be able to submit it after a password reset (#1250).
   const emailError = !email.trim()
     ? t('validation.required')
-    : !isEmail(email)
+    : isSetup && !isEmail(email)
       ? t('validation.email')
       : null
   const passwordError = !password
@@ -110,7 +124,7 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
   }
 
   if (showForgot && !isSetup) {
-    return <ForgotPasswordForm onBack={() => setShowForgot(false)} />
+    return <ForgotPasswordForm onBack={() => setShowForgot(false)} onAuthed={onAuthed} />
   }
 
   return (
@@ -144,9 +158,8 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
           </div>
           <div className="space-y-1.5">
             <Label className="text-xs" htmlFor="auth-password">{t('auth.password')}</Label>
-            <Input
+            <PasswordInput
               id="auth-password"
-              type="password"
               autoComplete={isSetup ? 'new-password' : 'current-password'}
               value={password}
               onChange={e => setPassword(e.target.value)}
@@ -201,7 +214,7 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
 
 type ForgotStep = 'request' | 'reset' | 'done'
 
-function ForgotPasswordForm({ onBack }: { onBack: () => void }) {
+function ForgotPasswordForm({ onBack, onAuthed }: { onBack: () => void; onAuthed: () => void }) {
   const { t } = useI18n()
   const [step, setStep] = useState<ForgotStep>('request')
   const [resetCode, setResetCode] = useState('')
@@ -239,10 +252,17 @@ function ForgotPasswordForm({ onBack }: { onBack: () => void }) {
     setBusy(true)
     setError('')
     try {
-      await apiFetch('/api/auth/reset-password', {
+      const res = await apiFetch<{ token?: string }>('/api/auth/reset-password', {
         method: 'POST',
         body: JSON.stringify({ resetCode: resetCode.trim(), newPassword }),
       })
+      // The server signs the operator in after a reset, so nobody has to
+      // remember which email the account uses (#1477).
+      if (res.token) {
+        setToken(res.token)
+        onAuthed()
+        return
+      }
       setStep('done')
     } catch (err) {
       setError((err as Error).message)
@@ -289,9 +309,8 @@ function ForgotPasswordForm({ onBack }: { onBack: () => void }) {
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs" htmlFor="reset-new-password">{t('auth.newPassword')}</Label>
-              <Input
+              <PasswordInput
                 id="reset-new-password"
-                type="password"
                 autoComplete="new-password"
                 value={newPassword}
                 onChange={e => setNewPassword(e.target.value)}
@@ -391,9 +410,8 @@ export function ChangeCredentialsModal({ mode, onClose }: ChangeCredentialsModal
         <form onSubmit={submit} className="space-y-3 mt-4" noValidate>
           <div className="space-y-1.5">
             <Label className="text-xs" htmlFor="cred-current-password">{t('auth.currentPassword')}</Label>
-            <Input
+            <PasswordInput
               id="cred-current-password"
-              type="password"
               autoComplete="current-password"
               value={currentPassword}
               onChange={e => setCurrentPassword(e.target.value)}
@@ -406,15 +424,22 @@ export function ChangeCredentialsModal({ mode, onClose }: ChangeCredentialsModal
             <Label className="text-xs" htmlFor="cred-new-value">
               {isPassword ? t('auth.newPassword') : t('auth.newEmail')}
             </Label>
-            <Input
+            {isPassword ? <PasswordInput
               id="cred-new-value"
-              type={isPassword ? 'password' : 'email'}
-              autoComplete={isPassword ? 'new-password' : 'email'}
+              autoComplete="new-password"
               value={newValue}
               onChange={e => setNewValue(e.target.value)}
-              placeholder={isPassword ? t('auth.passwordPlaceholderSetup') : t('auth.emailPlaceholder')}
+              placeholder={t('auth.passwordPlaceholderSetup')}
               aria-invalid={attempted && !!newValueError}
-            />
+            /> : <Input
+              id="cred-new-value"
+              type="email"
+              autoComplete="email"
+              value={newValue}
+              onChange={e => setNewValue(e.target.value)}
+              placeholder={t('auth.emailPlaceholder')}
+              aria-invalid={attempted && !!newValueError}
+            />}
             {attempted && <FieldError error={newValueError} />}
           </div>
           {error && <p className="text-destructive text-xs">{error}</p>}
@@ -452,7 +477,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // Desktop self-repair: one attempt at a time, and none after the shell has
   // handed back a session the server still rejects — a broken install shows a
   // message instead of looping.
-  const desktopSession = desktopSessionBridge()
+  const desktopSession = desktopSessionBridge() ?? (data?.desktop ? browserDesktopSession : null)
   const desktopNeedsSession = !!desktopSession && !!data && (data.needsSetup || !data.authenticated)
   const repairing = useRef(false)
   const [repairFailed, setRepairFailed] = useState(false)

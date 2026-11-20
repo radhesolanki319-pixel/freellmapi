@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { app } from 'electron';
+import type { GpuRecoveryState } from './gpu-recovery.js';
 
 export interface DesktopConfig {
   port?: number;
@@ -19,6 +20,13 @@ export interface DesktopConfig {
   // icon alone is a poor "is it running?" signal, and macOS 26 can hide it
   // outright (#807). Users who want the lean menu-bar-only look turn it off.
   showInDock?: boolean;
+  // Set once the dashboard has been opened at startup to show a first-time
+  // Windows user the app is running; the tray icon starts out hidden in the
+  // overflow flyout there (#1353).
+  launchDashboardShown?: boolean;
+  // Windows GPU-process recovery step for one app version (#1759). See
+  // gpu-recovery.ts.
+  gpuRecovery?: GpuRecoveryState;
 }
 
 function configPath(): string {

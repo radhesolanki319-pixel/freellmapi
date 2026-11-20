@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { invalidateSearchQueries } from '@/lib/search'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -10,7 +11,7 @@ import type { ImportKey, ImportSelectedResponse, Platform, PreviewKey, PreviewRe
 import { Upload } from 'lucide-react'
 import { useI18n } from '@/i18n'
 import { toast } from '@/lib/toast'
-import { CUSTOM_GROUP, PLATFORMS } from './shared'
+import { CUSTOM_GROUP, LISTED_PLATFORMS } from './shared'
 
 interface ImportRow extends PreviewKey {
   selected: boolean
@@ -34,7 +35,7 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
   // imported row is the one case where it belongs there: the file already
   // names the endpoint, and without the option the row can never be selected
   // and the endpoint can never be restored (#687).
-  const importablePlatforms = [...PLATFORMS.filter(p => !p.keyless), CUSTOM_GROUP]
+  const importablePlatforms = [...LISTED_PLATFORMS.filter(p => !p.keyless), CUSTOM_GROUP]
 
   function platformFromPreview(key: PreviewKey): Platform | '' {
     // A custom row is only importable with its base URL; there is nowhere to
@@ -76,6 +77,7 @@ export function ImportKeysSection({ onImported }: { onImported?: () => void } = 
       }),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['keys'] })
+      invalidateSearchQueries(queryClient)
       queryClient.invalidateQueries({ queryKey: ['health'] })
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
       queryClient.invalidateQueries({ queryKey: ['keys-providers'] })

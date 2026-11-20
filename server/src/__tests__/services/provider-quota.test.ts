@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import {
   recordQuotaObservation,
@@ -49,6 +49,20 @@ describe('provider-quota: pool inference', () => {
     expect(inferQuotaPoolKey('router9', 'another-model')).toBe('router9::monthly-credit');
     expect(inferQuotaPoolKey('septor', 'qwen3-coder-free')).toBe('septor::daily-free');
     expect(inferQuotaPoolKey('septor', 'minimax-m2.5-free')).toBe('septor::daily-free');
+    for (const model of ['first-model', 'another-model']) {
+      expect(inferQuotaPoolKey('varosity', model)).toBe('varosity::account-credit');
+      expect(inferQuotaPoolKey('aclide', model)).toBe('aclide::monthly-credit');
+      expect(inferQuotaPoolKey('speka', model)).toBe('speka::monthly-credit');
+      expect(inferQuotaPoolKey('plugsky', model)).toBe('plugsky::fair-use');
+      expect(inferQuotaPoolKey('clod', model)).toBe('clod::daily-free');
+      expect(inferQuotaPoolKey('blaze', model)).toBe('blaze::daily-free');
+      expect(inferQuotaPoolKey('speechify', model)).toBe('speechify::monthly-characters');
+      expect(inferQuotaPoolKey('lucidity', model)).toBe('lucidity::daily-free');
+      expect(inferQuotaPoolKey('airforce', model)).toBe('airforce::daily-free');
+      expect(inferQuotaPoolKey('dreamprompting', model)).toBe('dreamprompting::daily-free');
+      expect(inferQuotaPoolKey('waterfall', model)).toBe('waterfall::community-free');
+      expect(inferQuotaPoolKey('logfare', model)).toBe('logfare::fair-use');
+    }
     expect(inferQuotaPoolKey('openrouter', 'meta-llama/llama-3.1-8b-instruct:free')).toBe('openrouter::free');
     expect(inferQuotaPoolKey('openrouter', 'openai/gpt-4o')).toBe('openrouter::account');
     // AnyAPI's 100K tokens/day is one account-wide budget, so every model on
@@ -132,6 +146,22 @@ describe('provider-quota: record + read round-trip', () => {
     expect(readState('groq', 7, 'groq::account', 'tokens')?.remaining).toBe(10);
   });
 
+  it('keeps only a week of observations by default (#1675)', () => {
+    const db = getDb();
+    const now = Date.UTC(2026, 8, 1);
+    const stamp = (days: number) => new Date(now - days * 86_400_000).toISOString().slice(0, 19).replace('T', ' ');
+    const insert = db.prepare(`
+      INSERT INTO provider_quota_observations
+        (id, platform, key_id, quota_pool_key, metric, observed_at, created_at)
+      VALUES (?, 'groq', 7, 'groq::account', 'tokens', ?, ?)
+    `);
+    insert.run('old', stamp(10), stamp(10));
+    insert.run('fresh', stamp(1), stamp(1));
+
+    expect(pruneQuotaObservations(db, now)).toEqual({ deleted: 1, done: true });
+    expect(db.prepare('SELECT id FROM provider_quota_observations').all()).toEqual([{ id: 'fresh' }]);
+  });
+
   it('stops a large sweep at its time budget and reports it unfinished', () => {
     const db = getDb();
     const insert = db.prepare(`
@@ -200,6 +230,23 @@ describe('provider-quota: record + read round-trip', () => {
 });
 
 describe('provider-quota: parse from response headers (shared parseRetryAfterMs)', () => {
+  it('records Blaze token headers without fabricating a reset or per-model grant', () => {
+    const obs = parseQuotaObservationsFromResponse(new Response(null, { headers: {
+      'x-ratelimit-limit-tokens': '200000', 'x-ratelimit-remaining-tokens': '199499',
+    } }), { platform: 'blaze', modelId: 'test-model' });
+    expect(obs).toHaveLength(1);
+    expect(obs[0]).toMatchObject({ metric: 'tokens', limit: 200000, remaining: 199499, resetAt: null, quotaPoolKey: 'blaze::daily-free' });
+  });
+
+  it('records only CLōD\'s observed request window, not an invented daily token quota', () => {
+    const obs = parseQuotaObservationsFromResponse(new Response(null, { headers: {
+      'x-ratelimit-limit': '5', 'x-ratelimit-remaining': '4', 'x-ratelimit-reset': '1789230900',
+    } }), { platform: 'clod', modelId: 'test-model' });
+    expect(obs).toHaveLength(1);
+    expect(obs[0]).toMatchObject({ metric: 'requests', limit: 5, remaining: 4, quotaPoolKey: 'clod::daily-free' });
+    const speech = parseQuotaObservationsFromResponse(new Response(null), { platform: 'speechify' });
+    expect(speech.every(o => o.limit == null && o.remaining == null)).toBe(true);
+  });
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     initDb(':memory:');
@@ -284,7 +331,7 @@ describe('provider-quota: parse from response headers (shared parseRetryAfterMs)
   });
 });
 
-describe('provider-quota: reset_at replenishment on read (#453)', () => {
+describe('provider-quota: reset headroom without overwriting observations', () => {
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     initDb(':memory:');
@@ -298,7 +345,7 @@ describe('provider-quota: reset_at replenishment on read (#453)', () => {
   const past = () => new Date(Date.now() - 60 * 60 * 1000).toISOString();
   const future = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
-  it('restores remaining to the known limit once reset_at has passed, and persists it', () => {
+  it('displays replenished headroom without rewriting the reported balance', () => {
     insertState({ platform: 'groq', keyId: 1, pool: 'groq::account', metric: 'requests', limit: 100, remaining: 0, resetAt: past() });
 
     const states = getQuotaStateForKeys();
@@ -306,10 +353,10 @@ describe('provider-quota: reset_at replenishment on read (#453)', () => {
     expect(row!.remaining).toBe(100);      // replenished to the limit
     expect(row!.resetAt).toBeNull();        // stale reset dropped
 
-    // Persisted so it does not recur (the exhausted 0 is gone from the table).
+    // Forecast readers retain the actual reported zero and its original reset.
     const persisted = readState('groq', 1, 'groq::account', 'requests');
-    expect(persisted!.remaining).toBe(100);
-    expect(persisted!.resetAt).toBeNull();
+    expect(persisted!.remaining).toBe(0);
+    expect(persisted!.resetAt).not.toBeNull();
   });
 
   it('clears remaining to unknown when the limit is unknown and reset_at passed', () => {
@@ -321,7 +368,7 @@ describe('provider-quota: reset_at replenishment on read (#453)', () => {
     expect(row!.resetAt).toBeNull();
 
     const persisted = readState('ollama', 2, 'ollama::cloud', 'requests');
-    expect(persisted!.remaining).toBeNull();
+    expect(persisted!.remaining).toBe(0);
   });
 
   it('leaves a still-active window (reset_at in the future) untouched', () => {
@@ -331,5 +378,61 @@ describe('provider-quota: reset_at replenishment on read (#453)', () => {
     const row = states.find(s => s.platform === 'groq' && s.keyId === 3);
     expect(row!.remaining).toBe(0);         // still exhausted until it resets
     expect(row!.resetAt).not.toBeNull();
+  });
+});
+
+
+describe('provider quota snapshot reliability', () => {
+  const now = Date.parse('2026-09-15T12:00:00Z');
+  beforeEach(() => { initDb(':memory:'); vi.spyOn(Date, 'now').mockReturnValue(now); });
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    ['2m59.56s', 179560], ['7.66s', 7660], ['1h2m3s500ms', 3723500],
+    ['1d', 86400000], ['0s', 0], ['179.56', 179560],
+    [String(now / 1000 + 60), 60000], [String(now + 60000), 60000],
+    ['2026-09-15T12:01:00Z', 60000], ['2026-09-15T14:01:00+02:00', 60000],
+  ])('parses reset %s without dropping provider data', (reset, delay) => {
+    const response = new Response(null, {headers:{'x-ratelimit-limit-requests':'100','x-ratelimit-remaining-requests':'75','x-ratelimit-reset-requests':reset}});
+    expect(parseQuotaObservationsFromResponse(response,{platform:'groq'})[0].resetAt).toBe(new Date(now + delay).toISOString());
+  });
+
+  it.each(['', 'nonsense', '-5', 'Infinity', '1e99', '9999999999999999999', '2m invalid', 'NaNs'])('rejects invalid reset %j without throwing', reset => {
+    const response = new Response(null, {headers:{'x-ratelimit-limit-requests':'100','x-ratelimit-reset-requests':reset}});
+    expect(parseQuotaObservationsFromResponse(response,{platform:'groq'})[0].resetAt).toBeNull();
+  });
+
+  it('collects explicit compatible headers without a provider-specific mapping or fabricated limits', () => {
+    const response = new Response(null,{headers:{'x-ratelimit-limit-requests':'20','x-ratelimit-remaining-requests':'18','x-ratelimit-reset-requests':'1m'}});
+    expect(parseQuotaObservationsFromResponse(response,{platform:'kilo',keyId:4})[0]).toMatchObject({limit:20,remaining:18,resetAt:'2026-09-15T12:01:00.000Z'});
+    expect(parseQuotaObservationsFromResponse(new Response(null),{platform:'kilo'})[0]).toMatchObject({limit:null,remaining:null,resetAt:null});
+  });
+
+  it('does not replace valid quota headers with a generic 429 or mistake a 200 retry header for exhaustion', () => {
+    const headers={'x-ratelimit-limit-requests':'100','x-ratelimit-remaining-requests':'75','x-ratelimit-reset-requests':'2m','retry-after':'5'};
+    const rows=parseQuotaObservationsFromResponse(new Response(null,{status:429,headers}),{platform:'groq'});
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({remaining:75,source:'header',confidence:1,resetAt:'2026-09-15T12:02:00.000Z',retryAfterMs:5000});
+    expect(parseQuotaObservationsFromResponse(new Response(null,{headers:{'retry-after':'5'}}),{platform:'groq'}).some(row=>row.remaining===0)).toBe(false);
+  });
+
+  it('empty and limit-only probes cannot refresh a balance timestamp or borrow its confidence', () => {
+    const base={platform:'groq' as const,keyId:4};
+    recordQuotaObservation({...base,limit:100,remaining:50,resetAt:'2026-09-15T13:00:00Z',source:'header',observedAt:'2026-09-15T11:00:00Z'});
+    const before=getQuotaStateForKeys({normalizeExpired:false})[0];
+    const probe=recordQuotaObservation({...base,source:'probe',confidence:0.1,observedAt:'2026-09-15T12:00:00Z'});
+    recordQuotaObservation({...base,source:'header',limit:200,observedAt:'2026-09-15T12:01:00Z'});
+    expect(probe?.confidence).toBe(0.1);
+    expect(getQuotaStateForKeys({normalizeExpired:false})[0]).toMatchObject({limit:100,remaining:50,resetAt:before.resetAt,observedAt:before.observedAt,source:'header',confidence:1});
+    expect(getDb().prepare("SELECT confidence FROM provider_quota_observations WHERE source='probe'").get()).toEqual({confidence:0.1});
+  });
+
+  it('new balances replace the complete snapshot, including lower confidence and missing reset or limit', () => {
+    const base={platform:'groq' as const,keyId:4};
+    recordQuotaObservation({...base,limit:100,remaining:50,resetAt:'2026-09-15T13:00:00Z',source:'header',observedAt:'2026-09-15T11:00:00Z'});
+    recordQuotaObservation({...base,remaining:0,source:'error_body',confidence:0.55,observedAt:'2026-09-15T12:00:00Z'});
+    expect(getQuotaStateForKeys({normalizeExpired:false})[0]).toMatchObject({remaining:0,limit:null,resetAt:null,confidence:0.55,source:'error_body'});
+    recordQuotaObservation({...base,remaining:100,limit:100,source:'header',observedAt:'2026-09-15T10:00:00Z'});
+    expect(getQuotaStateForKeys({normalizeExpired:false})[0].remaining).toBe(0);
   });
 });

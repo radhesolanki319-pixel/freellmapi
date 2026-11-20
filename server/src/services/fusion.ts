@@ -2,22 +2,26 @@ import { z } from 'zod';
 import type { ChatMessage, ChatCompletionChoice, ChatCompletionResponse, ChatToolCall, TokenUsage } from '@freellmapi/shared/types.js';
 import {
   routePinnedModel, routeRequest, getOrderedFusionChain, resolveFusionCandidate,
-  recordRateLimitHit, recordSuccess, type RouteResult, type FusionCandidate,
+  pinnedModelFitsRequestSize,
+  recordRateLimitHit, recordSuccess, failureAttributionFor, type RouteResult, type FusionCandidate,
 } from './router.js';
 import {
   recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit,
   getCooldownDecisionForLimit,
   getPaymentRequiredCooldownMs, getModelForbiddenCooldownMs,
+  learnLimitFromError, learnContextWindowFromError,
 } from './ratelimit.js';
 import { logRequest } from '../lib/request-log.js';
 import {
   isRetryableError, isRateLimitSignal, isPaymentRequiredError,
   isModelNotFoundError, isModelAccessForbiddenError,
+  isContextTooLargeError, isDailyQuotaExhaustedError,
 } from '../lib/error-classify.js';
 import { contentToString, stripImagesFromMessages } from '../lib/content.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { getSetting, setSetting } from '../db/index.js';
 import type { CompletionOptions } from '../providers/base.js';
+import { routeOutputBudget } from '../lib/output-cap.js';
 
 // The virtual model id that triggers multi-model synthesis. Mirrors how
 // `auto` is a virtual id the router intercepts (see routes/proxy.ts).
@@ -170,12 +174,50 @@ const SYNTHESIS_QUORUM = 2;
 const MAX_SLOT_ATTEMPTS = 4;
 // Judge dispatch walks the normal auto chain; give it room to fail over.
 const MAX_JUDGE_ATTEMPTS = 6;
+// Tool calls are actions, not independent prose. Running a whole Fusion panel
+// for them is both unsafe (several models can propose the same side effect)
+// and needlessly slow (one stalled provider holds Promise.allSettled open).
+// Keep each sequential candidate bounded well below the provider's generous
+// cold-start timeout; a slower candidate can still be reached through the
+// normal ordered fallback list after this one is abandoned.
+const DEFAULT_TOOL_CALL_TIMEOUT_MS = 12_000;
+const MAX_TOOL_CALL_TIMEOUT_MS = 120_000;
 
 function intSetting(key: string, fallback: number): number {
   const raw = getSetting(key);
   if (!raw) return fallback;
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function toolCallTimeoutMs(): number {
+  return Math.min(
+    intSetting('fusion_tool_timeout_ms', DEFAULT_TOOL_CALL_TIMEOUT_MS),
+    MAX_TOOL_CALL_TIMEOUT_MS,
+  );
+}
+
+/**
+ * Give one tool-bearing panel candidate its own deadline while preserving the
+ * caller's disconnect signal. The timer is cancelled as soon as the candidate
+ * settles; aborting a request is deliberately scoped to this candidate so a
+ * later fallback can still run.
+ */
+function withToolCallDeadline(options: CompletionOptions): { options: CompletionOptions; cancel: () => void } {
+  const controller = new AbortController();
+  const timeoutMs = toolCallTimeoutMs();
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`fusion tool call timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  timer.unref?.();
+
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, controller.signal])
+    : controller.signal;
+  return {
+    options: { ...options, signal },
+    cancel: () => clearTimeout(timer),
+  };
 }
 
 function panelDefaultK(): number {
@@ -305,8 +347,14 @@ interface PanelAnswer {
   toolCalls?: ChatToolCall[];
   rawChoice?: ChatCompletionChoice;
   error?: string;
+  failure?: CallFailure;
   usage?: TokenUsage;
 }
+
+// Why a model call produced no answer, so an all-failed panel can report the
+// right status: a prompt too big for every model will never fit (413), a
+// rate-limited panel may recover (429), anything else is an upstream failure.
+type CallFailure = 'context_too_large' | 'rate_limited' | 'error';
 
 interface CallOutcome {
   ok: boolean;
@@ -316,6 +364,30 @@ interface CallOutcome {
   rawChoice?: ChatCompletionChoice;
   usage?: TokenUsage;
   error?: string;
+  failure?: CallFailure;
+}
+
+function classifyCallFailure(err: any): CallFailure {
+  if (isContextTooLargeError(err)) return 'context_too_large';
+  if (isRateLimitSignal(err) || isPaymentRequiredError(err) || isDailyQuotaExhaustedError(err)) return 'rate_limited';
+  return 'error';
+}
+
+// A model too small for this request stays too small for it on every key, so
+// once one attempt says so the call's failure is context_too_large for good.
+function mergeCallFailure(current: CallFailure | undefined, next: CallFailure): CallFailure {
+  return current === 'context_too_large' ? current : next;
+}
+
+// Too big for this model is a fact about the REQUEST, not the model's health,
+// the same rule as recordRetryableFailure in lib/fallback-loop.ts: skip the
+// model for this request and learn the ceiling the provider reported so the
+// router sizes it out before the next oversized dispatch, but never cool it
+// down or penalize it (#1479).
+function noteContextTooLarge(route: RouteResult, err: any, skipModels: Set<number>): void {
+  learnLimitFromError(route.modelDbId, err);
+  learnContextWindowFromError(route.modelDbId, err);
+  skipModels.add(route.modelDbId);
 }
 
 const ZERO_USAGE: TokenUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
@@ -336,16 +408,22 @@ function addUsage(a: TokenUsage, b: TokenUsage | undefined): TokenUsage {
  * WHICH model is tried: a pinned-model closure for a panel slot (never
  * substitutes), or the auto-router for the judge (falls over across the chain).
  */
-async function runModelCall(
+// Exported for the attribution regression test: the panel/judge retry path is
+// the fusion mirror of lib/fallback-loop.ts's recordRetryableFailure.
+export async function runModelCall(
   getRoute: (skipKeys: Set<string>, skipModels: Set<number>) => RouteResult | null,
   messages: ChatMessage[],
   options: CompletionOptions,
   estimatedTokens: number,
   maxAttempts: number,
+  // Why the call failed when no route was ever available. Defaults to
+  // rate_limited (every key cooling down or over quota).
+  noRouteFailure: () => CallFailure = () => 'rate_limited',
 ): Promise<CallOutcome> {
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
   let lastError: string | undefined;
+  let failure: CallFailure | undefined;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     let route: RouteResult | null;
@@ -357,10 +435,17 @@ async function runModelCall(
       break;
     }
     if (!route) break;
+    // A pinned panel slot keeps handing back its one model; once that model is
+    // ruled out for this request there is nothing left to try.
+    if (skipModels.has(route.modelDbId)) {
+      route.release?.();
+      break;
+    }
 
     const startedAt = Date.now();
+    const routeOpts = { ...options, contextBudget: routeOutputBudget(route, estimatedTokens) };
     try {
-      const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, options);
+      const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, routeOpts);
       const choice = result.choices?.[0];
       const text = contentToString(choice?.message?.content ?? '');
       const toolCalls = choice?.message?.tool_calls;
@@ -373,6 +458,7 @@ async function runModelCall(
         setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
         recordRateLimitHit(route.modelDbId);
         lastError = `empty completion from ${route.displayName}`;
+        failure = mergeCallFailure(failure, 'error');
         continue;
       }
 
@@ -391,12 +477,29 @@ async function runModelCall(
       };
     } catch (err: any) {
       const safe = sanitizeProviderErrorMessage(err?.message);
-      logRequest(route.platform, route.modelId, route.keyId, 'error', 0, 0, Date.now() - startedAt, safe, null, FUSION_TAG, null, 'http');
+      // #1347: mirror the fallback loop — with provider-moment attribution on,
+      // a 429/5xx/timeout/transport failure on a fusion panel slot is the
+      // provider's bad minute, not model evidence: the key still cools down,
+      // but the model's rate-limit penalty is skipped and the log row is
+      // tagged so the stats cache excludes it.
+      const attribution = failureAttributionFor(err);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', 0, 0, Date.now() - startedAt, safe, null, FUSION_TAG, null, 'http', attribution);
       lastError = safe;
+      failure = mergeCallFailure(failure, classifyCallFailure(err));
 
+      if (isContextTooLargeError(err)) {
+        noteContextTooLarge(route, err, skipModels);
+        continue;
+      }
       if (isRetryableError(err)) {
         if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+        // An adapter's own capability/allow-list rejection is request-specific,
+        // not evidence that the key hit a rate limit.
+        if (err?.providerRejection === 'request' || err?.providerRejection === 'model') {
+          skipModels.add(route.modelDbId);
+          continue;
+        }
         // Provenance mirrors cooldownDecisionForError (lib/fallback-loop.ts):
         // credit/tier benches are never probe-recovered, Retry-After-backed
         // ones only when our heuristic outlasted the provider's own retry time.
@@ -406,7 +509,7 @@ async function runModelCall(
           ? { durationMs: getModelForbiddenCooldownMs(), source: 'tier' as const }
           : getCooldownDecisionForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err.retryAfterMs, { quotaSignal: isRateLimitSignal(err) });
         setCooldown(route.platform, route.modelId, route.keyId, decision.durationMs, decision.source);
-        recordRateLimitHit(route.modelDbId);
+        if (attribution !== 'provider_moment') recordRateLimitHit(route.modelDbId);
         continue;
       }
       // Non-retryable (auth, validation) — this slot/judge is done.
@@ -419,7 +522,13 @@ async function runModelCall(
     }
   }
 
-  return { ok: false, error: lastError ?? 'no available key for model' };
+  if (failure == null) {
+    failure = noRouteFailure();
+    if (failure === 'context_too_large' && lastError == null) {
+      lastError = `request (~${estimatedTokens} tokens) does not fit this model's context window`;
+    }
+  }
+  return { ok: false, error: lastError ?? 'no available key for model', failure };
 }
 
 /**
@@ -445,12 +554,18 @@ async function runJudgeStreaming(
     let route: RouteResult | null;
     try { route = getRoute(skipKeys, skipModels); } catch (err: any) { lastError = sanitizeProviderErrorMessage(err?.message); break; }
     if (!route) break;
+    // A pinned judge keeps handing back its one model (see runModelCall).
+    if (skipModels.has(route.modelDbId)) {
+      route.release?.();
+      break;
+    }
 
     const startedAt = Date.now();
+    const routeOpts = { ...options, contextBudget: routeOutputBudget(route, estimatedTokens) };
     let text = '';
     let started = false;
     try {
-      for await (const chunk of route.provider.streamChatCompletion(route.apiKey, messages, route.modelId, options)) {
+      for await (const chunk of route.provider.streamChatCompletion(route.apiKey, messages, route.modelId, routeOpts)) {
         const delta = (chunk as any)?.choices?.[0]?.delta?.content;
         if (typeof delta === 'string' && delta.length > 0) {
           if (!started) { started = true; cb.onStart?.({ platform: route.platform, model: route.modelId }); }
@@ -475,7 +590,9 @@ async function runJudgeStreaming(
       return { ok: true, route, text, usage };
     } catch (err: any) {
       const safe = sanitizeProviderErrorMessage(err?.message);
-      logRequest(route.platform, route.modelId, route.keyId, 'error', 0, 0, Date.now() - startedAt, safe, null, FUSION_TAG, null, 'http');
+      // #1347: same attribution as the panel path above.
+      const attribution = failureAttributionFor(err);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', 0, 0, Date.now() - startedAt, safe, null, FUSION_TAG, null, 'http', attribution);
       lastError = safe;
       // Already streamed bytes — can't fail over without duplicating output.
       // Keep whatever the client already received.
@@ -486,9 +603,17 @@ async function runJudgeStreaming(
         }
         break;
       }
+      if (isContextTooLargeError(err)) {
+        noteContextTooLarge(route, err, skipModels);
+        continue;
+      }
       if (isRetryableError(err)) {
         if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+        if (err?.providerRejection === 'request' || err?.providerRejection === 'model') {
+          skipModels.add(route.modelDbId);
+          continue;
+        }
         // Same provenance mapping as the non-stream path above.
         const decision = isPaymentRequiredError(err)
           ? { durationMs: getPaymentRequiredCooldownMs(), source: 'credit' as const }
@@ -496,7 +621,7 @@ async function runJudgeStreaming(
           ? { durationMs: getModelForbiddenCooldownMs(), source: 'tier' as const }
           : getCooldownDecisionForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err.retryAfterMs, { quotaSignal: isRateLimitSignal(err) });
         setCooldown(route.platform, route.modelId, route.keyId, decision.durationMs, decision.source);
-        recordRateLimitHit(route.modelDbId);
+        if (attribution !== 'provider_moment') recordRateLimitHit(route.modelDbId);
         continue;
       }
       break;
@@ -653,10 +778,54 @@ export interface FusionResult {
  */
 export class FusionError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
   }
+}
+
+function contextTooLargeError(estimatedTokens: number, trail = ''): FusionError {
+  return new FusionError(
+    `fusion: the request (~${estimatedTokens} tokens) is too large for every panel model's context window or token limit. ` +
+      'Retrying will not help: reduce the prompt/history size, or send it to a larger-context model instead of fusion.' +
+      trail,
+    413,
+    'context_length_exceeded',
+  );
+}
+
+/**
+ * The error for a panel with no survivors, chosen from why each slot failed
+ * (the same ladder as exhaustedRetryError in lib/fallback-loop.ts):
+ *   - every slot too small for the prompt → 413: it can never fit, and a 429
+ *     here sent agent clients into a retry loop on a request that cannot
+ *     succeed (#1479);
+ *   - any slot rate-limited → 429: that model may answer once it recovers;
+ *   - otherwise (timeouts, 5xx, bad responses) → 502: the upstreams failed.
+ */
+function emptyPanelError(answers: PanelAnswer[], estimatedTokens: number): FusionError {
+  const failures = answers.map(a => a.failure ?? 'error');
+  const trail = ` Panel: ${answers.map(a => `${a.modelId} (${truncateReason(a.error)})`).join('; ')}.`;
+  if (failures.length > 0 && failures.every(f => f === 'context_too_large')) {
+    return contextTooLargeError(estimatedTokens, trail);
+  }
+  if (failures.includes('rate_limited')) {
+    return new FusionError(
+      'fusion: every panel model failed or was rate-limited. Try again shortly or pick different `fusion.models`.' + trail,
+      429,
+    );
+  }
+  return new FusionError(
+    'fusion: every panel model failed upstream. Try again or pick different `fusion.models`.' + trail,
+    502,
+  );
+}
+
+function truncateReason(reason: string | undefined): string {
+  const text = reason ?? 'failed';
+  return text.length > 200 ? `${text.slice(0, 197)}...` : text;
 }
 
 // Progress hooks for a streaming fusion request. Fired as each panel slot
@@ -686,8 +855,24 @@ export async function runFusion(params: {
   const strategy = config.strategy ?? 'synthesize';
 
   const requireTools = (options.tools?.length ?? 0) > 0;
+  const requiresToolCall = options.tool_choice === 'required'
+    || (typeof options.tool_choice === 'object' && options.tool_choice !== null);
+  const requiredToolName = typeof options.tool_choice === 'object'
+    ? options.tool_choice.function.name
+    : undefined;
+  // `tool_choice=auto` (or an omitted choice) still allows a model to emit a
+  // structured call. Continue past a prose-only candidate so a later capable
+  // model gets a chance; `none` is the explicit opt-out and may stop at prose.
+  const acceptsToolCall = options.tool_choice !== 'none';
   const { panel, overflow, dropped } = selectPanel(config, { requireTools, requireVision: vision, estimatedTokens });
   if (panel.length === 0) {
+    // The auto-panel drops models whose context window or TPM ceiling cannot
+    // hold the prompt. When that is the only reason the panel is empty, the
+    // request can never be served as sent: say so with a 413 instead of
+    // pointing the user at their model setup.
+    if (selectPanel(config, { requireTools, requireVision: vision, estimatedTokens: 1 }).panel.length > 0) {
+      throw contextTooLargeError(estimatedTokens);
+    }
     const hint = vision
       ? 'No vision-capable model is servable for the panel. Enable a vision model in the Fallback Chain or pass `fusion.models` with vision-capable model ids.'
       : 'Provide `fusion.models` with enabled model ids, or enable models in the Fallback Chain.';
@@ -701,12 +886,18 @@ export async function runFusion(params: {
   // model's keys (so a key 429 doesn't collapse the slot onto a duplicate
   // backend — issue #326). Returns its answer and fires onPanel the moment it
   // settles so a streaming client sees answers arrive one by one.
-  const runSlot = (cand: FusionCandidate): Promise<PanelAnswer> =>
+  const runSlot = (cand: FusionCandidate, slotOptions: CompletionOptions = options): Promise<PanelAnswer> =>
     runModelCall(
       (skipKeys) => routePinnedModel(cand.modelDbId, estimatedTokens, skipKeys),
-      messages, options, estimatedTokens, MAX_SLOT_ATTEMPTS,
+      messages, slotOptions, estimatedTokens, MAX_SLOT_ATTEMPTS,
+      () => pinnedModelFitsRequestSize(cand.modelDbId, estimatedTokens) ? 'rate_limited' : 'context_too_large',
     ).then((outcome): PanelAnswer => {
-      const answer: PanelAnswer = outcome.ok
+      const returnedToolCalls = outcome.toolCalls;
+      const forbiddenToolCall = options.tool_choice === 'none' && !!returnedToolCalls?.length;
+      const wrongNamedTool = !!requiredToolName
+        && !!returnedToolCalls?.length
+        && returnedToolCalls.some(tc => tc.function?.name !== requiredToolName);
+      const answer: PanelAnswer = outcome.ok && !wrongNamedTool && !forbiddenToolCall
         ? {
             modelDbId: cand.modelDbId,
             platform: cand.platform,
@@ -718,7 +909,19 @@ export async function runFusion(params: {
             rawChoice: outcome.rawChoice,
             usage: outcome.usage,
           }
-        : { modelDbId: cand.modelDbId, platform: cand.platform, modelId: cand.modelId, displayName: cand.displayName, status: 'failed', error: outcome.error };
+        : {
+            modelDbId: cand.modelDbId,
+            platform: cand.platform,
+            modelId: cand.modelId,
+            displayName: cand.displayName,
+            status: 'failed',
+            error: wrongNamedTool
+              ? `provider returned a tool call other than required function '${requiredToolName}'`
+              : forbiddenToolCall
+              ? 'provider returned a tool call despite tool_choice=none'
+              : outcome.error,
+            failure: outcome.ok ? 'error' : outcome.failure,
+          };
       hooks?.onPanel?.({ platform: answer.platform, model: answer.modelId, status: answer.status, content: answer.content, tool_calls: answer.toolCalls, error: answer.error });
       return answer;
     });
@@ -735,29 +938,52 @@ export async function runFusion(params: {
   const answers: PanelAnswer[] = [];
   let okCount = 0;
   let cursor = 0;
-  while (okCount < target && cursor < candidates.length) {
-    const wave = candidates.slice(cursor, cursor + (target - okCount));
-    cursor += wave.length;
-    const settled = await Promise.allSettled(wave.map(runSlot));
-    settled.forEach((s, i) => {
-      const a: PanelAnswer = s.status === 'fulfilled'
-        ? s.value
-        : { modelDbId: wave[i].modelDbId, platform: wave[i].platform, modelId: wave[i].modelId, displayName: wave[i].displayName, status: 'failed', error: sanitizeProviderErrorMessage((s as PromiseRejectedResult).reason?.message) };
-      answers.push(a);
-      if (a.status === 'ok' && (a.content || (a.toolCalls?.length ?? 0) > 0)) okCount++;
-    });
+  if (requireTools) {
+    // Tool calls are not safely mergeable: the client may execute the returned
+    // action, so asking several models in parallel can produce duplicate or
+    // contradictory side effects. Walk the ordered candidates one at a time,
+    // stopping at the first structured call (or the target number of prose
+    // survivors when the model declines to call). Each candidate gets a bounded signal so a slow
+    // provider cannot hold the Responses stream open for its full 180s
+    // cold-start budget. This also makes fallback deterministic and releases
+    // the provider lease before the next candidate starts.
+    while (cursor < candidates.length) {
+      const cand = candidates[cursor++];
+      const deadline = withToolCallDeadline(options);
+      let answer: PanelAnswer;
+      try {
+        answer = await runSlot(cand, deadline.options);
+      } finally {
+        deadline.cancel();
+      }
+      answers.push(answer);
+      const usable = answer.status === 'ok' && (answer.content || (answer.toolCalls?.length ?? 0) > 0);
+      if (usable) {
+        okCount++;
+        if (answer.toolCalls?.length && acceptsToolCall) break;
+        if (!acceptsToolCall || (!requiresToolCall && okCount >= target)) break;
+      }
+    }
+  } else {
+    while (okCount < target && cursor < candidates.length) {
+      const wave = candidates.slice(cursor, cursor + (target - okCount));
+      cursor += wave.length;
+      const settled = await Promise.allSettled(wave.map(cand => runSlot(cand)));
+      settled.forEach((s, i) => {
+        const a: PanelAnswer = s.status === 'fulfilled'
+          ? s.value
+          : { modelDbId: wave[i].modelDbId, platform: wave[i].platform, modelId: wave[i].modelId, displayName: wave[i].displayName, status: 'failed', error: sanitizeProviderErrorMessage((s as PromiseRejectedResult).reason?.message), failure: 'error' };
+        answers.push(a);
+        if (a.status === 'ok' && (a.content || (a.toolCalls?.length ?? 0) > 0)) okCount++;
+      });
+    }
   }
 
   const survivors = answers.filter(a => a.status === 'ok' && (a.content || (a.toolCalls?.length ?? 0) > 0));
   let totalUsage: TokenUsage = { ...ZERO_USAGE };
   for (const a of survivors) totalUsage = addUsage(totalUsage, a.usage);
 
-  if (survivors.length === 0) {
-    throw new FusionError(
-      'fusion: every panel model failed or was rate-limited. Try again shortly or pick different `fusion.models`.',
-      429,
-    );
-  }
+  if (survivors.length === 0) throw emptyPanelError(answers, estimatedTokens);
 
   // Tool calls are actions, not prose. They cannot be safely synthesized across
   // models, so the first panel survivor that returned structured tool_calls
@@ -808,6 +1034,16 @@ export async function runFusion(params: {
       response,
       routedVia: `fusion(${survivors.map(a => a.modelId).join('+')} -> tool_call:${toolCallWinner.modelId})`,
     };
+  }
+
+  if (requiresToolCall) {
+    // `tool_choice=required` (or a named function choice) is a contract with
+    // the caller. Returning prose after every candidate ignored that contract
+    // would leave an agent waiting for a tool result that can never arrive.
+    throw new FusionError(
+      'fusion: no panel model returned the required tool call. Try again or pick a tool-capable `fusion.models` entry.',
+      502,
+    );
   }
 
   const textSurvivors = survivors.filter(a => a.content);

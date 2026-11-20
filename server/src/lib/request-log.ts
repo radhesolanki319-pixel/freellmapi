@@ -1,5 +1,6 @@
 import { getDb } from '../db/index.js';
 import { pruneRequestAnalytics } from '../services/request-retention.js';
+import { noteBudgetAlerts } from '../services/budget-alerts.js';
 import { getClientContext } from './client-context.js';
 import { noteRequestRowId, type RequestTrace } from './attempt-trace.js';
 
@@ -29,6 +30,34 @@ function setSettingIfMissing(db: LogTx, key: string, value: string): void {
   `).run(key, value);
 }
 
+// Resolve the concrete models.id for a request (#1187). Catalog requests
+// resolve by (platform, model_id); custom requests resolve through the
+// request's key (its normalized base_url is the row's endpoint_scope).
+// Returns NULL when the request is unattributable — a custom request whose
+// key never reached routing, or whose key no longer resolves to a matching
+// model row. An unattributable request must not land on the wrong relay.
+function resolveModelDbId(
+  db: LogTx,
+  platform: string,
+  modelId: string,
+  keyId: number | null,
+): number | null {
+  if (platform !== 'custom') {
+    const row = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ? LIMIT 1')
+      .get(platform, modelId) as { id: number } | undefined;
+    return row?.id ?? null;
+  }
+  if (keyId == null) return null;
+  const key = db.prepare("SELECT base_url FROM api_keys WHERE id = ? AND platform = 'custom'")
+    .get(keyId) as { base_url: string | null } | undefined;
+  if (!key?.base_url) return null;
+  const scope = key.base_url.trim().replace(/\/+$/, '');
+  const row = db.prepare(
+    'SELECT id FROM models WHERE platform = ? AND model_id = ? AND endpoint_scope = ? LIMIT 1',
+  ).get('custom', modelId, scope) as { id: number } | undefined;
+  return row?.id ?? null;
+}
+
 // Append a row to the request analytics table. Shared by the chat proxy, the
 // responses path, and the fusion panel so every served (or failed) sub-request
 // is logged identically. Lives in a neutral lib module to avoid an import cycle
@@ -41,9 +70,12 @@ function setSettingIfMissing(db: LogTx, key: string, value: string): void {
 //
 // In addition to the raw row, we update two durable aggregates so analytics
 // totals survive the raw-row prune (REQUEST_ANALYTICS_MAX_ROWS):
-//   - request_hourly: per-hour bucket counts and tokens (max window = 30d).
+//   - request_hourly: per-hour bucket counts and tokens; its age bound follows
+//     the raw table's retention (see services/request-retention.ts), so it backs
+//     every window the dashboard offers, "all time" included.
 //   - settings: lifetime totals (total_requests, total_input_tokens, total_output_tokens)
-//     plus first_request_at (set on the first ever logged request).
+//     plus first_request_at (set on the first ever logged request). These never
+//     prune, so they are the exact all-time headline.
 // All upserts run in the same transaction so the aggregates never disagree
 // with the raw row count.
 export function logRequest(
@@ -78,7 +110,12 @@ export function logRequest(
   // without a migration. NULL for call sites that pass no caller — notably
   // the shared fallback loop's 'canceled' row, which is surface-agnostic.
   caller: string | null = null,
-) {
+  // #1347 (PR 1): 'provider_moment' when a failed attempt is attributed to
+  // the provider's minute (429 / 5xx / timeout / transport) instead of the
+  // model — written only when the failure-attribution setting is on; NULL
+  // everywhere else, including every success row and every historical row.
+  failureAttribution: string | null = null,
+): boolean {
   try {
     const db = getDb();
     // Caller identity from the request-scoped context (set by the express
@@ -86,9 +123,9 @@ export function logRequest(
     const client = getClientContext();
     const tx = db.transaction(() => {
       const insert = db.prepare(`
-        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, served_model, client_ip, client_user_agent, client_agent, caller)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, servedModel, client.ip, client.userAgent, client.agent, caller);
+        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, served_model, client_ip, client_user_agent, client_agent, caller, model_db_id, failure_attribution)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, servedModel, client.ip, client.userAgent, client.agent, caller, resolveModelDbId(db, platform, modelId, keyId), failureAttribution);
 
       // Report the row id back to the fallback loop's attempt trace (if one is
       // active): the LAST id noted during a loop run is the terminal row the
@@ -121,8 +158,15 @@ export function logRequest(
     tx();
 
     pruneRequestAnalytics({ db });
+
+    // Soft budget alerts (#1158 follow-on): after the ledger trigger committed,
+    // compare this key's month usage to its caps and log a threshold event
+    // (80%/100%, once each per month). Never throws.
+    if (status === 'success' && keyId != null) noteBudgetAlerts(keyId);
+    return true;
   } catch (e) {
     console.error('Failed to log request:', e);
+    return false;
   }
 }
 

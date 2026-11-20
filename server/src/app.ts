@@ -16,6 +16,8 @@ import { fallbackRouter } from './routes/fallback.js';
 import { profilesRouter } from './routes/profiles.js';
 import { embeddingsRouter } from './routes/embeddings.js';
 import { mediaRouter } from './routes/media.js';
+import { searchRouter } from './routes/search.js';
+import { decisionsRouter } from './routes/decisions.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { freeTierRouter } from './routes/free-tier.js';
@@ -32,13 +34,21 @@ import { geminiRouter } from './routes/gemini.js';
 import { ollamaRouter } from './routes/ollama.js';
 import { urlTokenRouter } from './routes/url-tokens.js';
 import { updateRouter } from './routes/update.js';
+import { moderationRouter } from './routes/moderation.js';
 import { requireAuth } from './middleware/requireAuth.js';
+import { createHostGuard } from './middleware/allowed-hosts.js';
 import { createProxyRateLimiter, createAdminRateLimiter } from './middleware/rateLimit.js';
 
 // Password-guess ceiling for GET /api/keys/export. Deliberately low: a real
 // user exports keys occasionally, never ten times a minute.
 const EXPORT_RATE_LIMIT_RPM = 10;
+// Same idea for POST /api/keys/:id/reveal (#1885), which also re-checks the
+// password. Looser than export because a user may copy several keys in a row,
+// but far below the 600/min dashboard limit it used to share.
+const REVEAL_RATE_LIMIT_RPM = 60;
+const REVEAL_PATH_RE = /^\/[^/]+\/reveal\/?$/;
 import { errorHandler } from './middleware/errorHandler.js';
+import { collapseDoubledV1Prefix } from './middleware/doubled-v1.js';
 import { clientContextMiddleware } from './lib/client-context.js';
 import type { Config } from './lib/config.js';
 import { loadConfig } from './lib/config.js';
@@ -102,6 +112,13 @@ export function createApp(config?: Config) {
   // /CIDRs trusts only those proxies. Must be set before client-context and
   // the rate-limit middleware, which both resolve the client IP.
   app.set('trust proxy', cfg.trustProxy);
+  // DNS-rebinding guard (#1637), first middleware so a rebinding request is
+  // rejected before helmet, CORS, body parsing, auth or routing. Opt-in: off
+  // until ALLOWED_HOSTS lists a hostname, then loopback + those names pass
+  // ('*' keeps it off). Must sit
+  // above everything below — its whole value is answering before any state or
+  // credential is touched.
+  app.use(createHostGuard(cfg.allowedHosts));
   const allowedCorsOrigins = new Set([
     ...DEFAULT_DASHBOARD_ORIGINS,
     ...cfg.dashboardOrigins,
@@ -176,6 +193,14 @@ export function createApp(config?: Config) {
 
     next();
   });
+  // Forgive a doubled `/v1` prefix (#1956). Anthropic-style clients (Claude
+  // Desktop's gateway, Claude Code, the Anthropic SDK) append `/v1/...` to the
+  // base URL themselves, so a user who pastes the OpenAI-style base URL
+  // (`http://host:port/v1`) ends up calling `/v1/v1/models` and gets a bare
+  // 404. Strip the duplicate before any path-scoped middleware or router sees
+  // it, so the request gets the same body limits, rate limiting and auth as
+  // the canonical path.
+  app.use(collapseDoubledV1Prefix);
   app.use(cors({
     origin(origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
       callback(null, !origin || allowedCorsOrigins.has(origin));
@@ -215,23 +240,38 @@ export function createApp(config?: Config) {
   );
   app.use(ollamaRouter);
 
-  // Dashboard auth (#35): /api/auth/{status,setup,login} bootstrap without a
-  // session; everything else under /api/* requires a logged-in dashboard user.
-  // The /v1 proxy keeps its own unified-API-key auth and is NOT gated here.
-  app.use('/api/auth', authRouter);
-
   // Admin API — all routes share an IP-based rate limiter to throttle
   // brute-force attempts (auth, key export, etc). The limiter is mounted
   // broadly on /api; requireAuth gates each sub-path individually so that
   // unauthenticated endpoints under /api (like /api/ping) are not blocked.
+  //
+  // This MUST stay above the /api/auth mount below. Express runs middleware in
+  // registration order, so while the limiter was registered after authRouter,
+  // authRouter answered and ended /api/auth/login before the limiter was ever
+  // entered — leaving the password endpoint this comment names as the reason
+  // for the limiter as the one /api path it did not cover. It still sits below
+  // the Ollama /api/* mount above, which carries its own proxy limiter.
   const adminRateLimiter = createAdminRateLimiter();
   app.use('/api', adminRateLimiter);
+
+  // Dashboard auth (#35): /api/auth/{status,setup,login} bootstrap without a
+  // session; everything else under /api/* requires a logged-in dashboard user.
+  // The /v1 proxy keeps its own unified-API-key auth and is NOT gated here.
+  app.use('/api/auth', authRouter);
 
   // Key export re-verifies the dashboard password, which makes it the one admin
   // endpoint a guesser can attack. The broad limiter above is sized for normal
   // dashboard traffic and far too loose for that, so this path gets its own
   // tight per-IP bucket on top of it.
   app.use('/api/keys/export', createAdminRateLimiter(EXPORT_RATE_LIMIT_RPM));
+  const revealRateLimiter = createAdminRateLimiter(REVEAL_RATE_LIMIT_RPM);
+  app.use('/api/keys', (req, res, next) => {
+    if (req.method === 'POST' && REVEAL_PATH_RE.test(req.path)) {
+      revealRateLimiter(req, res, next);
+      return;
+    }
+    next();
+  });
 
   app.use('/api/keys', requireAuth, keysRouter);
   // Per-client key management (#411). Dashboard-session gated like the rest of
@@ -250,6 +290,8 @@ export function createApp(config?: Config) {
   app.use('/api/fallback', requireAuth, fallbackRouter);
   app.use('/api/embeddings', requireAuth, embeddingsRouter);
   app.use('/api/media', requireAuth, mediaRouter);
+  app.use('/api/search', requireAuth, searchRouter);
+  app.use('/api/decisions', requireAuth, decisionsRouter);
   app.use('/api/analytics', requireAuth, analyticsRouter);
   app.use('/api/health', requireAuth, healthRouter);
   app.use('/api/free-tier', requireAuth, freeTierRouter);
@@ -295,6 +337,8 @@ export function createApp(config?: Config) {
   // paths it doesn't own fall through to the OpenAI router untouched.
   app.use('/v1', anthropicRouter);
   app.use('/v1', proxyRouter);
+  // OpenAI Moderation API shim (POST /v1/moderations)
+  app.use('/v1', moderationRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
 

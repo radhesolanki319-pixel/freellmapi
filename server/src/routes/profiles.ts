@@ -8,6 +8,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { monthlyBudgetScore } from '../lib/budget.js';
 
 export const profilesRouter = Router();
 
@@ -51,6 +52,9 @@ const updateSchema = z.object({
   auto_sort: z.enum(['intelligence', 'speed', 'budget']).nullable().optional(),
   layout_config: z.string().nullable().optional(),
   auto_include_new_models: z.boolean().optional(),
+  // Per-chain routing preset (#1696). NULL/omitted inherits the global
+  // routing_strategy, so untouched chains behave exactly as before.
+  routing_strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable']).nullable().optional(),
 });
 
 function getId(req: Request): number {
@@ -65,7 +69,7 @@ function getId(req: Request): number {
 profilesRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
   const profiles = db.prepare(`
-    SELECT id, name, emoji, color, type, is_favorite, sort_order, auto_sort, layout_config, auto_include_new_models, created_at
+    SELECT id, name, emoji, color, type, is_favorite, sort_order, auto_sort, routing_strategy, layout_config, auto_include_new_models, created_at
     FROM profiles
     ORDER BY (CASE WHEN type = 'default' THEN 1 ELSE 0 END) DESC, is_favorite DESC, sort_order ASC, id ASC
   `).all();
@@ -138,7 +142,7 @@ profilesRouter.get('/:id/models', (req: Request, res: Response) => {
 profilesRouter.post('/', (req: Request, res: Response) => {
   const parsed = createSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    res.status(400).json({ error: { message: parsed.error.issues.map(e => e.message).join(', ') } });
     return;
   }
 
@@ -189,7 +193,7 @@ profilesRouter.post('/', (req: Request, res: Response) => {
     }
   }
 
-  const created = db.prepare('SELECT id, name, emoji, color, type, is_favorite, sort_order, auto_sort, layout_config, auto_include_new_models, created_at FROM profiles WHERE id = ?').get(profileId);
+  const created = db.prepare('SELECT id, name, emoji, color, type, is_favorite, sort_order, auto_sort, routing_strategy, layout_config, auto_include_new_models, created_at FROM profiles WHERE id = ?').get(profileId);
   res.status(201).json(created);
 });
 
@@ -206,7 +210,7 @@ function copyFromDefault(db: any, profileId: number) {
 profilesRouter.put('/:id', (req: Request, res: Response) => {
   const db = getDb();
   const profileId = getId(req);
-  const profile = db.prepare('SELECT id, type FROM profiles WHERE id = ?').get(profileId) as any;
+  const profile = db.prepare('SELECT id, name, type FROM profiles WHERE id = ?').get(profileId) as any;
   if (!profile) {
     res.status(404).json({ error: { message: 'Profile not found' } });
     return;
@@ -214,7 +218,18 @@ profilesRouter.put('/:id', (req: Request, res: Response) => {
 
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    res.status(400).json({ error: { message: parsed.error.issues.map(e => e.message).join(', ') } });
+    return;
+  }
+
+  const isProtected = profile.type === 'default' || profile.type === 'builtin';
+
+  // A chain's name is the address clients route with (auto:<name>), and the
+  // built-in names are fixed in docs and client configs. Say so with a 403
+  // rather than silently dropping the rename (#1179); an unchanged name sent
+  // along with other fields still passes.
+  if (isProtected && parsed.data.name !== undefined && parsed.data.name !== profile.name) {
+    res.status(403).json({ error: { message: 'Built-in chains cannot be renamed' } });
     return;
   }
 
@@ -227,7 +242,6 @@ profilesRouter.put('/:id', (req: Request, res: Response) => {
     }
   }
 
-  const isProtected = profile.type === 'default' || profile.type === 'builtin';
   const updates: string[] = [];
   const values: any[] = [];
   for (const [key, value] of Object.entries(parsed.data)) {
@@ -256,7 +270,7 @@ profilesRouter.put('/:id', (req: Request, res: Response) => {
     sortProfileModels(db, profileId, parsed.data.auto_sort);
   }
 
-  const updated = db.prepare('SELECT id, name, emoji, color, type, is_favorite, sort_order, auto_sort, layout_config, auto_include_new_models, created_at FROM profiles WHERE id = ?').get(profileId);
+  const updated = db.prepare('SELECT id, name, emoji, color, type, is_favorite, sort_order, auto_sort, routing_strategy, layout_config, auto_include_new_models, created_at FROM profiles WHERE id = ?').get(profileId);
   res.json(updated);
 });
 
@@ -278,7 +292,7 @@ profilesRouter.put('/:id/reorder', (req: Request, res: Response) => {
 
   const parsed = reorderSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    res.status(400).json({ error: { message: parsed.error.issues.map(e => e.message).join(', ') } });
     return;
   }
 
@@ -329,7 +343,7 @@ profilesRouter.post('/:id/reset', (req: Request, res: Response) => {
   });
   transaction();
 
-  const updated = db.prepare('SELECT id, name, emoji, color, type, is_favorite, sort_order, auto_sort, layout_config, auto_include_new_models, created_at FROM profiles WHERE id = ?').get(profileId);
+  const updated = db.prepare('SELECT id, name, emoji, color, type, is_favorite, sort_order, auto_sort, routing_strategy, layout_config, auto_include_new_models, created_at FROM profiles WHERE id = ?').get(profileId);
   res.json(updated);
 });
 
@@ -375,38 +389,18 @@ const SORT_PRESETS: Record<string, string> = {
   speed: 'm.speed_rank ASC',
 };
 
-function getBudgetScore(m: { monthly_token_budget: string; tpd_limit: number | null }): number {
-  if (m.tpd_limit != null) return m.tpd_limit * 30;
-  
-  const str = m.monthly_token_budget;
-  if (!str) return 0;
-  if (str.toLowerCase().includes('unlimited') || str.includes('∞')) return Infinity;
-  
-  const cleanStr = str.split('(')[0];
-  const matches = cleanStr.match(/[\d.]+/g);
-  let maxNum = 0;
-  if (matches) {
-    maxNum = Math.max(...matches.map(mStr => parseFloat(mStr)));
-  }
-  
-  let mult = 1;
-  const upper = cleanStr.toUpperCase();
-  if (upper.includes('B')) mult = 1_000_000_000;
-  else if (upper.includes('M')) mult = 1_000_000;
-  else if (upper.includes('K')) mult = 1_000;
-
-  return maxNum * mult;
-}
-
 function sortProfileModels(db: any, profileId: number, preset: string) {
   let models: { id: number }[] = [];
 
   if (preset === 'budget') {
     const allModels = db.prepare(`SELECT id, monthly_token_budget, tpd_limit FROM models`).all() as any[];
-    allModels.sort((a, b) => getBudgetScore(b) - getBudgetScore(a));
+    allModels.sort((a, b) => monthlyBudgetScore(b) - monthlyBudgetScore(a));
     models = allModels.map(m => ({ id: m.id }));
   } else {
-    const orderBy = SORT_PRESETS[preset];
+    // `Object.hasOwn`, not a bare index: a plain read answers for inherited
+    // members too, so `constructor`/`toString` used to slip past this guard
+    // (the function object is truthy) and crash `prepare()` with a 500.
+    const orderBy = Object.hasOwn(SORT_PRESETS, preset) ? SORT_PRESETS[preset] : undefined;
     if (!orderBy) {
       throw new Error(`Unknown preset: ${preset}. Use: intelligence, speed, budget`);
     }

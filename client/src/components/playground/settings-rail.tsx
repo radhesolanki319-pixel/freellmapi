@@ -1,4 +1,4 @@
-import { PanelRightClose, PanelRightOpen } from 'lucide-react'
+import { ChevronsLeft, ChevronsRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { ModelCombobox, type ModelComboOption } from '@/components/model-combobox'
@@ -48,10 +48,23 @@ export interface SettingsRailProps {
   onSelectModel: (value: string) => void
   /** Shown under the picker when no platform has an enabled key yet. */
   noModels: boolean
+  /** Speech-to-text picker for the composer's mic (#playground dictation). */
+  dictationValue: string
+  dictationOptions: ModelComboOption[]
+  onSelectDictation: (value: string) => void
+  dictationUnavailableHint?: string
   systemPrompt: string
   onSystemPromptChange: (value: string) => void
   sampling: SamplingSettings
   onSamplingChange: (next: SamplingSettings) => void
+  /** Look the question up with POST /v1/search before answering (#1174). */
+  webSearch: boolean
+  onWebSearchChange: (enabled: boolean) => void
+  /** False until at least one search key is configured. */
+  webSearchAvailable: boolean
+  webSearchUnavailableHint?: string
+  /** Enabled engines in failover order, e.g. "Tavily → Exa". */
+  webSearchChain: string
 }
 
 function SamplingControlRow({
@@ -132,16 +145,25 @@ export function SettingsRail({
   modelValue,
   modelOptions,
   onSelectModel,
+  dictationValue,
+  dictationOptions,
+  onSelectDictation,
+  dictationUnavailableHint,
   noModels,
   systemPrompt,
   onSystemPromptChange,
   sampling,
   onSamplingChange,
+  webSearch,
+  onWebSearchChange,
+  webSearchAvailable,
+  webSearchUnavailableHint,
+  webSearchChain,
 }: SettingsRailProps) {
   const { t } = useI18n()
   // Anything the collapsed strip should own up to: a system prompt riding on
   // every request, or a knob overriding the provider's default.
-  const tweaked = samplingActiveCount(sampling) > 0 || systemPrompt.trim().length > 0
+  const tweaked = samplingActiveCount(sampling) > 0 || systemPrompt.trim().length > 0 || webSearch
 
   return (
     <div
@@ -161,7 +183,7 @@ export function SettingsRail({
           aria-label={t('playground.showSettings')}
           title={t('playground.showSettings')}
         >
-          <PanelRightOpen className="size-4" />
+          <ChevronsLeft className="size-4" />
         </Button>
         {tweaked && <span className="size-1.5 rounded-full bg-primary/70" />}
       </div>
@@ -169,7 +191,7 @@ export function SettingsRail({
       <div
         className={`${LAYER} w-72 ${open ? 'visible opacity-100' : 'invisible opacity-0'}`}
       >
-        <div className="flex shrink-0 items-center gap-1 border-b px-2.5 py-2">
+        <div className="flex shrink-0 items-center gap-1 px-2.5 py-1">
           <span className="flex-1 truncate text-xs font-medium text-muted-foreground">
             {t('settings.title')}
           </span>
@@ -180,7 +202,7 @@ export function SettingsRail({
             aria-label={t('playground.hideSettings')}
             title={t('playground.hideSettings')}
           >
-            <PanelRightClose className="size-4" />
+            <ChevronsRight className="size-4" />
           </Button>
         </div>
 
@@ -204,6 +226,27 @@ export function SettingsRail({
                 ) : undefined
               }
             />
+          </div>
+
+          {/* Which speech-to-text model the mic uses. Auto lets the router pick
+              among the transcription models that have a key; with none, the
+              picker shows the same guidance as the mic. */}
+          <div className="space-y-1.5">
+            <span className="block text-xs font-medium">{t('playground.dictationModel')}</span>
+            {dictationUnavailableHint ? (
+              <p className="text-xs text-muted-foreground">{dictationUnavailableHint}</p>
+            ) : (
+              <ModelCombobox
+                value={dictationValue}
+                options={dictationOptions}
+                onSelect={onSelectDictation}
+                ariaLabel={t('playground.dictationModel')}
+                placeholder={t('playground.searchModels')}
+                emptyText={t('playground.noModelsFound')}
+                align="end"
+                triggerClassName="flex h-8 w-full items-center justify-between gap-2 whitespace-nowrap rounded-lg border border-input bg-transparent px-3 text-sm outline-none transition-colors hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+              />
+            )}
           </div>
 
           {/* The system prompt textarea deliberately lives BELOW the composer in
@@ -239,6 +282,32 @@ export function SettingsRail({
                 onChange={onSamplingChange}
               />
             ))}
+          </div>
+
+          <div className="space-y-2">
+            <div className="space-y-0.5">
+              <span className="block text-xs font-medium">{t('search.playgroundHeading')}</span>
+              <p className="text-[11px] leading-snug text-muted-foreground">
+                {webSearchAvailable ? t('search.playgroundHelp') : webSearchUnavailableHint ?? t('search.playgroundNoKeys')}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <label htmlFor="playground-web-search" className="flex-1 text-xs">
+                {t('search.playgroundToggle')}
+              </label>
+              <Switch
+                id="playground-web-search"
+                size="sm"
+                checked={webSearch && webSearchAvailable}
+                onCheckedChange={onWebSearchChange}
+                disabled={!webSearchAvailable}
+              />
+            </div>
+            {webSearchAvailable && webSearchChain && (
+              <p className="text-[11px] text-muted-foreground">
+                {t('search.playgroundEngines', { chain: webSearchChain })}
+              </p>
+            )}
           </div>
         </div>
       </div>

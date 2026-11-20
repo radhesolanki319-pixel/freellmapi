@@ -2,7 +2,12 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { initDb, getDb, setSetting, getSetting } from '../../db/index.js';
 import { applyCatalog, reapplyCachedCatalog, MIN_CATALOG_VERSION } from '../../services/catalog-sync.js';
 import { runMigrationsSync } from '../../db/migrate/runner.js';
-import { recordCatalogModelTombstone, upsertModelOverrides } from '../../services/model-state.js';
+import {
+  getCatalogModelTombstone,
+  recordCatalogModelTombstone,
+  retireCatalogModelUpstream,
+  upsertModelOverrides,
+} from '../../services/model-state.js';
 
 // applyCatalog is the write path between the published catalog and the live
 // router DB. These tests lock its contract: catalog metadata always wins, the
@@ -115,20 +120,6 @@ describe('applyCatalog', () => {
     expect(fb).toBeTruthy();
   });
 
-  it('caps GitHub GPT-4.1 catalog context at the routable free-tier limit (#426)', () => {
-    const models = existingAsCatalogModels();
-    const target = models.find((m) => m.platform === 'github' && m.modelId === 'openai/gpt-4.1');
-    expect(target).toBeDefined();
-    target!.contextWindow = 128000;
-
-    applyCatalog(getDb(), catalogOf(models));
-
-    const row = getDb()
-      .prepare("SELECT context_window FROM models WHERE platform = 'github' AND model_id = 'openai/gpt-4.1'")
-      .get() as { context_window: number };
-    expect(row.context_window).toBe(8000);
-  });
-
   it('updates metadata in place and respects the enabled policy', () => {
     const models = existingAsCatalogModels();
     const target = models.find((m) => m.modelId === 'brand-new-model')!;
@@ -170,6 +161,27 @@ describe('applyCatalog', () => {
     expect(counts.removed).toBe(1);
     expect(getDb().prepare("SELECT id FROM models WHERE model_id = 'brand-new-model'").get()).toBeUndefined();
     expect(getDb().prepare('SELECT id FROM fallback_config WHERE model_db_id = ?').get(before.id)).toBeUndefined();
+  });
+
+  it('sweeps rows pinned to keys that no longer exist (#1516)', () => {
+    const db = getDb();
+    // 999999 names no api_keys row: exactly the orphan the delete cascade
+    // used to leave behind on standard platforms.
+    const chat = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, key_id, enabled, source)
+      VALUES ('groq', 'orphan-sync-chat-1516', 'Orphan Chat', 50, 50, 'Large', 999999, 1, 'user')
+    `).run();
+    db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 9999, 1)').run(chat.lastInsertRowid);
+    db.prepare(`
+      INSERT INTO embedding_models (family, platform, model_id, display_name, dimensions, priority, enabled, quota_label, key_id)
+      VALUES ('fam-sync-1516', 'groq', 'orphan-sync-embed-1516', 'Orphan Embed', 768, 1, 1, 'test', 999999)
+    `).run();
+
+    const counts = applyCatalog(db, catalogOf(existingAsCatalogModels()));
+    expect(counts.removed).toBeGreaterThanOrEqual(2);
+    expect(db.prepare("SELECT id FROM models WHERE model_id = 'orphan-sync-chat-1516'").get()).toBeUndefined();
+    expect(db.prepare('SELECT id FROM fallback_config WHERE model_db_id = ?').get(chat.lastInsertRowid)).toBeUndefined();
+    expect(db.prepare("SELECT id FROM embedding_models WHERE model_id = 'orphan-sync-embed-1516'").get()).toBeUndefined();
   });
 
   it('never touches custom-provider models', () => {
@@ -239,6 +251,50 @@ describe('applyCatalog', () => {
     const counts = applyCatalog(getDb(), catalogOf(models));
     expect(counts.skippedUnknownPlatform).toBeGreaterThanOrEqual(1);
     expect(getDb().prepare("SELECT id FROM models WHERE platform = 'some-future-provider'").get()).toBeUndefined();
+  });
+
+  it('skips Auray rows a catalog still carries after the provider was removed (#1583)', () => {
+    const models = existingAsCatalogModels();
+    models.push(baseModel({ platform: 'auray', modelId: 'kimi-k3' }));
+    const counts = applyCatalog(getDb(), catalogOf(models));
+    expect(counts.skippedUnknownPlatform).toBeGreaterThanOrEqual(1);
+    expect(getDb().prepare("SELECT id FROM models WHERE platform = 'auray'").get()).toBeUndefined();
+  });
+
+  it('imports the new chat providers and keeps Speechify exclusively in audio', () => {
+    const models = existingAsCatalogModels();
+    models.push(baseModel({ platform: 'clod', modelId: 'test-clod' }));
+    models.push(baseModel({ platform: 'blaze', modelId: 'test-blaze' }));
+    models.push(baseModel({ platform: 'speechify', modelId: 'test-simba', modality: 'audio' }));
+    applyCatalog(getDb(), catalogOf(models));
+    for (const platform of ['clod', 'blaze']) {
+      expect(getDb().prepare('SELECT enabled FROM models WHERE platform = ?').get(platform)).toEqual({ enabled: 1 });
+    }
+    expect(getDb().prepare("SELECT id FROM models WHERE platform = 'speechify'").get()).toBeUndefined();
+    expect(getDb().prepare("SELECT model_id, modality, enabled FROM media_models WHERE platform = 'speechify'").get()).toEqual({ model_id: 'test-simba', modality: 'audio', enabled: 1 });
+  });
+
+  it('imports Free.ai speech only from the catalog, never as a chat model or bundled seed', () => {
+    expect(getDb().prepare("SELECT id FROM media_models WHERE platform='freeai'").get()).toBeUndefined();
+    const catalog = catalogOf([...existingAsCatalogModels(), baseModel({ platform: 'freeai', modelId: 'kokoro', modality: 'audio' })]);
+    applyCatalog(getDb(), catalog);
+    applyCatalog(getDb(), catalog);
+    expect(getDb().prepare("SELECT id FROM models WHERE platform='freeai'").get()).toBeUndefined();
+    expect(getDb().prepare("SELECT model_id, modality, enabled FROM media_models WHERE platform='freeai'").all()).toEqual([{ model_id: 'kokoro', modality: 'audio', enabled: 1 }]);
+  });
+
+  it('adds Speka chat and embedding rows only when the signed catalog supplies them', () => {
+    expect(getDb().prepare("SELECT id FROM models WHERE platform = 'speka'").get()).toBeUndefined();
+    expect(getDb().prepare("SELECT id FROM embedding_models WHERE platform = 'speka'").get()).toBeUndefined();
+    const catalog = catalogOf([...existingAsCatalogModels(), baseModel({ platform: 'speka', modelId: 'z-ai/glm-5.3' })]);
+    catalog.embeddings = [...existingAsCatalogEmbeddings(), {
+      family: 'nemotron-3-embed-1b-speka', platform: 'speka', modelId: 'nvidia/nemotron-3-embed-1b',
+      displayName: 'Nemotron 3 Embed 1B (Speka)', dimensions: 2048, maxInputTokens: 8192,
+      priority: 1, enabled: true, quotaLabel: '$1/month shared',
+    }];
+    applyCatalog(getDb(), catalog);
+    expect(getDb().prepare("SELECT enabled FROM models WHERE platform = 'speka'").get()).toEqual({ enabled: 1 });
+    expect(getDb().prepare("SELECT dimensions, enabled FROM embedding_models WHERE platform = 'speka'").get()).toEqual({ dimensions: 2048, enabled: 1 });
   });
 
   it('applies the full embedding snapshot and retires a replaced provider id', () => {
@@ -351,6 +407,42 @@ describe('reapplyCachedCatalog', () => {
     expect(
       getDb().prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(victim.platform, victim.modelId),
     ).toBeUndefined();
+  });
+
+  it('keeps an upstream retirement across a cached re-apply, and lifts it only for a newer catalog', () => {
+    // The re-apply replays the snapshot the retirement already post-dates, so
+    // it must not read that snapshot as a newer opinion — otherwise every 410
+    // (#634) is undone by the next restart. A genuinely newer catalog still
+    // wins, which is what the lift exists for.
+    const models = existingAsCatalogModels();
+    models.push(baseModel({ modelId: 'replay-retired', displayName: 'Replay Retired' }));
+    const catalog = catalogOf(models);
+    applyCatalog(getDb(), catalog);
+    cacheCatalog(catalog);
+
+    const row = getDb()
+      .prepare("SELECT id FROM models WHERE platform = 'groq' AND model_id = 'replay-retired'")
+      .get() as { id: number };
+    expect(retireCatalogModelUpstream(getDb(), row.id, 'groq', 'replay-retired', 'HTTP 410 gone')).toBe(true);
+    const chainOff = () =>
+      (getDb().prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(row.id) as { enabled: number }).enabled;
+    expect(chainOff()).toBe(0);
+
+    expect(reapplyCachedCatalog().reapplied).toBe(true);
+    expect(getCatalogModelTombstone(getDb(), 'chat', 'groq', 'replay-retired')?.source).toBe('upstream_eol');
+    expect(chainOff()).toBe(0);
+    // Retirement disables the chain entries, never the row: the dashboard keeps
+    // showing it as retired upstream rather than losing it.
+    expect(
+      (getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(row.id) as { enabled: number }).enabled,
+    ).toBe(1);
+
+    // Same model, still listed enabled, but a catalog the install has not seen.
+    const newer = catalogOf(existingAsCatalogModels());
+    newer.version = '2099.02.02';
+    applyCatalog(getDb(), newer);
+    expect(getCatalogModelTombstone(getDb(), 'chat', 'groq', 'replay-retired')).toBeUndefined();
+    expect(chainOff()).toBe(1);
   });
 
   it('clears the applied version when an older install has no cached document', () => {
@@ -654,5 +746,201 @@ describe('applyCatalog: generative media meta', () => {
     (catalog.models[catalog.models.length - 2] as any).requestStyle = 42;
     setSetting('catalog_applied_json', JSON.stringify(catalog));
     expect(reapplyCachedCatalog().reapplied).toBe(false);
+  });
+});
+
+// Web search engines (#1174) ride their own optional registry into
+// media_models with modality 'search', on the same rules as video: a catalog
+// without the key keeps the bundled baseline, one with it is a full snapshot.
+describe('applyCatalog: searchEngines', () => {
+  type CatalogSearch = NonNullable<AnyCatalog['searchEngines']>[number];
+
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+  });
+
+  function searchRoster(): CatalogSearch[] {
+    return [
+      {
+        platform: 'exa', engineId: 'exa-search', displayName: 'Exa Search', priority: 0, enabled: true,
+        quotaLabel: '$10/month in credits', creditsPerQuery: null,
+        features: { news: true, answer: false, fullContent: true },
+      },
+      {
+        platform: 'tavily', engineId: 'tavily-search', displayName: 'Tavily Search', priority: 1, enabled: true,
+        quotaLabel: '1,000 credits/month', creditsPerQuery: 1,
+        features: { news: true, answer: true }, premiumSince: '2026-10-13T00:00:00.000Z',
+      },
+    ];
+  }
+
+  function searchCatalog(entries?: CatalogSearch[]): AnyCatalog {
+    const catalog = catalogOf(existingAsCatalogModels());
+    if (entries) catalog.searchEngines = entries;
+    return catalog;
+  }
+
+  function searchRows(): Array<{ platform: string; model_id: string; enabled: number; priority: number; quota_label: string; meta_json: string | null }> {
+    return getDb().prepare(`
+      SELECT platform, model_id, enabled, priority, quota_label, meta_json
+        FROM media_models WHERE modality = 'search' ORDER BY priority, id
+    `).all() as any;
+  }
+
+  it('ships no search engines until a catalog carries the registry', () => {
+    expect(searchRows()).toEqual([]);
+  });
+
+  it('applies the registry as a full snapshot with metadata in meta_json', () => {
+    applyCatalog(getDb(), searchCatalog(searchRoster()));
+    expect(searchRows().map(r => `${r.platform}:${r.model_id}`)).toEqual(['exa:exa-search', 'tavily:tavily-search']);
+    expect(searchRows()[0].quota_label).toBe('$10/month in credits');
+    expect(JSON.parse(searchRows()[1].meta_json!)).toEqual({
+      creditsPerQuery: 1,
+      features: { news: true, answer: true },
+      premiumSince: '2026-10-13T00:00:00.000Z',
+    });
+  });
+
+  it('keeps existing engines when a catalog omits the optional registry', () => {
+    applyCatalog(getDb(), searchCatalog(undefined));
+    expect(searchRows()).toHaveLength(2);
+  });
+
+  it('removes every engine when the registry is empty (a free catalog before an engine ages in)', () => {
+    const counts = applyCatalog(getDb(), searchCatalog([]));
+    expect(counts.removed).toBeGreaterThanOrEqual(2);
+    expect(searchRows()).toEqual([]);
+    applyCatalog(getDb(), searchCatalog(searchRoster()));
+    expect(searchRows()).toHaveLength(2);
+  });
+
+  it('keeps a local disable across catalog applies', () => {
+    getDb().prepare("UPDATE media_models SET enabled = 0 WHERE model_id = 'exa-search'").run();
+    applyCatalog(getDb(), searchCatalog(searchRoster()));
+    expect(searchRows().find(r => r.model_id === 'exa-search')!.enabled).toBe(0);
+  });
+
+  it('never prunes a custom search relay', () => {
+    getDb().prepare(`
+      INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label)
+      VALUES ('custom', 'my-searxng', 'My SearXNG', 'search', 9, 1, 'custom endpoint')
+    `).run();
+    applyCatalog(getDb(), searchCatalog(searchRoster()));
+    expect(searchRows().map(r => r.model_id)).toContain('my-searxng');
+  });
+
+  it('skips an engine whose platform has no search adapter in this binary', () => {
+    const roster = searchRoster();
+    roster.push({ platform: 'kagi', engineId: 'kagi-search', displayName: 'Kagi', priority: 5, enabled: true });
+    const counts = applyCatalog(getDb(), searchCatalog(roster));
+    expect(counts.skippedUnknownPlatform).toBeGreaterThanOrEqual(1);
+    expect(searchRows().map(r => r.model_id)).not.toContain('kagi-search');
+  });
+
+  it('rejects a malformed searchEngines entry before applying the cached catalog', () => {
+    const catalog = searchCatalog(searchRoster());
+    (catalog.searchEngines![0] as any).priority = 'first';
+    setSetting('catalog_applied_json', JSON.stringify(catalog));
+    expect(reapplyCachedCatalog().reapplied).toBe(false);
+  });
+});
+
+// Decision models ride their own optional registry into media_models with
+// modality 'decision', on the same rules as search engines.
+describe('applyCatalog: decisionModels', () => {
+  type CatalogDecision = NonNullable<AnyCatalog['decisionModels']>[number];
+
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+  });
+
+  function decisionRoster(): CatalogDecision[] {
+    return [
+      {
+        platform: 'cloudflare', modelId: '@cf/cloudflare/clef-flash', displayName: 'Clef Flash', priority: 0, enabled: true,
+        quotaLabel: 'Workers AI free daily neurons', contextWindow: 24576, premiumSince: '2026-09-15T00:00:00.000Z',
+      },
+      {
+        platform: 'openrouter', modelId: 'inception/mercury-decide:free', displayName: 'Mercury Decide (free)', priority: 1, enabled: true,
+      },
+    ];
+  }
+
+  function decisionCatalog(entries?: CatalogDecision[]): AnyCatalog {
+    const catalog = catalogOf(existingAsCatalogModels());
+    if (entries) catalog.decisionModels = entries;
+    return catalog;
+  }
+
+  function decisionRows(): Array<{ platform: string; model_id: string; enabled: number; quota_label: string; meta_json: string | null }> {
+    return getDb().prepare(`
+      SELECT platform, model_id, enabled, quota_label, meta_json
+        FROM media_models WHERE modality = 'decision' ORDER BY priority, id
+    `).all() as any;
+  }
+
+  it('ships no decision models until a catalog carries the registry', () => {
+    expect(decisionRows()).toEqual([]);
+  });
+
+  it('applies the registry as a full snapshot with metadata in meta_json', () => {
+    applyCatalog(getDb(), decisionCatalog(decisionRoster()));
+    expect(decisionRows().map(r => `${r.platform}:${r.model_id}`))
+      .toEqual(['cloudflare:@cf/cloudflare/clef-flash', 'openrouter:inception/mercury-decide:free']);
+    expect(JSON.parse(decisionRows()[0].meta_json!)).toEqual({ contextWindow: 24576, premiumSince: '2026-09-15T00:00:00.000Z' });
+  });
+
+  it('never adds decision models to the chat models table', () => {
+    const chat = getDb().prepare("SELECT COUNT(*) AS n FROM models WHERE model_id IN ('@cf/cloudflare/clef-flash', 'inception/mercury-decide:free')").get() as { n: number };
+    expect(chat.n).toBe(0);
+  });
+
+  it('keeps existing rows when a catalog omits the registry, prunes on an empty one', () => {
+    applyCatalog(getDb(), decisionCatalog(undefined));
+    expect(decisionRows()).toHaveLength(2);
+    applyCatalog(getDb(), decisionCatalog([]));
+    expect(decisionRows()).toEqual([]);
+    applyCatalog(getDb(), decisionCatalog(decisionRoster()));
+    expect(decisionRows()).toHaveLength(2);
+  });
+
+  it('keeps a local disable across catalog applies', () => {
+    getDb().prepare("UPDATE media_models SET enabled = 0 WHERE model_id = 'inception/mercury-decide:free'").run();
+    applyCatalog(getDb(), decisionCatalog(decisionRoster()));
+    expect(decisionRows().find(r => r.platform === 'openrouter')!.enabled).toBe(0);
+  });
+
+  it('skips a model whose platform has no decision adapter in this binary', () => {
+    const roster = decisionRoster();
+    roster.push({ platform: 'groq', modelId: 'some-decider', displayName: 'Nope', priority: 5, enabled: true });
+    const counts = applyCatalog(getDb(), decisionCatalog(roster));
+    expect(counts.skippedUnknownPlatform).toBeGreaterThanOrEqual(1);
+    expect(decisionRows().map(r => r.model_id)).not.toContain('some-decider');
+  });
+
+  it('rejects a malformed decisionModels entry before applying the cached catalog', () => {
+    const catalog = decisionCatalog(decisionRoster());
+    (catalog.decisionModels![0] as any).enabled = 'yes';
+    setSetting('catalog_applied_json', JSON.stringify(catalog));
+    expect(reapplyCachedCatalog().reapplied).toBe(false);
+  });
+
+  it('never prunes a custom decision row (#1777)', () => {
+    // A user-registered custom decision row is not a catalog row: a catalog
+    // sync carrying the built-in registry must leave it alone, the way the
+    // custom search relay survives a search sync. Without the
+    // CATALOG_DECISION_PLATFORMS exclusion, adding 'custom' to the adapters
+    // would make the prune loop delete this row on the next sync.
+    getDb().prepare(`
+      INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label)
+      VALUES ('custom', 'my-decider', 'My Decider', 'decision', 9, 1, 'custom endpoint')
+    `).run();
+    applyCatalog(getDb(), decisionCatalog(decisionRoster()));
+    expect(decisionRows().map(r => r.model_id)).toContain('my-decider');
+    applyCatalog(getDb(), decisionCatalog([]));
+    expect(decisionRows().map(r => r.model_id)).toEqual(['my-decider']);
   });
 });

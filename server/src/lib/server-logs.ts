@@ -54,6 +54,17 @@ export const MAX_MESSAGE_LENGTH = 6000;
 const TRUNCATION_SUFFIX = '… [truncated]';
 
 /**
+ * Ceiling on warn/error rows written per second. The table is pruned only on
+ * the request path, so an idle server has no retention at all; a log storm (a
+ * dead stdout feeding the safety net, a provider erroring in a tight loop) must
+ * not be able to grow it without bound. Lines over the cap still reach the live
+ * ring — only the row is skipped — and the next line after the window rolls
+ * writes one summary row saying how many were dropped.
+ */
+export const PERSIST_MAX_PER_SECOND = 50;
+const PERSIST_WINDOW_MS = 1000;
+
+/**
  * The viewer polls GET /api/logs every couple of seconds. If the deployment in
  * front of us emits access-log lines, those polls would be the loudest thing in
  * the buffer and every poll would manufacture the content of the next one.
@@ -108,6 +119,11 @@ let persisting = false;
 
 /** Reentrancy guard for the boot seed, for the same reason as `persisting`. */
 let seeding = false;
+
+/** Persist rate-cap window (see PERSIST_MAX_PER_SECOND). */
+let persistWindowStartMs = 0;
+let persistWindowCount = 0;
+let persistSuppressed = 0;
 
 // ── Formatting ───────────────────────────────────────────────────────────────
 
@@ -193,8 +209,39 @@ export function recordLogEntry(options: RecordLogOptions): ServerLogEntry | null
   if (requestId) entry.requestId = requestId;
 
   push(entry);
-  if (PERSISTED_LEVELS.has(entry.level)) persist(entry);
+  if (PERSISTED_LEVELS.has(entry.level)) persistCapped(entry);
   return entry;
+}
+
+function persistCapped(entry: ServerLogEntry): void {
+  if (entry.tsMs - persistWindowStartMs >= PERSIST_WINDOW_MS || entry.tsMs < persistWindowStartMs) {
+    const dropped = persistSuppressed;
+    persistWindowStartMs = entry.tsMs;
+    persistWindowCount = 0;
+    persistSuppressed = 0;
+    if (dropped > 0) {
+      const summary: ServerLogEntry = {
+        id: ++lastId,
+        tsMs: entry.tsMs,
+        level: 'warn',
+        source: 'server-logs',
+        message: `[server-logs] ${dropped} warn/error lines not persisted (over ${PERSIST_MAX_PER_SECOND}/s); they reached the live view only`,
+      };
+      // Keep ids increasing in arrival order: the summary takes the next id and
+      // the line that rolled the window is re-stamped after it.
+      entry.id = ++lastId;
+      ring.splice(ring.length - 1, 0, summary);
+      if (ring.length > RING_CAPACITY) ring.shift();
+      persist(summary);
+      persistWindowCount++;
+    }
+  }
+  if (persistWindowCount >= PERSIST_MAX_PER_SECOND) {
+    persistSuppressed++;
+    return;
+  }
+  persistWindowCount++;
+  persist(entry);
 }
 
 function push(entry: ServerLogEntry): void {
@@ -408,6 +455,9 @@ export interface LogQuery {
   levels?: ServerLogLevel[];
   q?: string;
   provider?: string;
+  /** Exact structured event name (e.g. 'key_invalid') — same contract as
+   *  provider: case-sensitive equality against entry.event. */
+  event?: string;
   sinceId?: number;
   limit?: number;
 }
@@ -438,12 +488,20 @@ export function levelCounts(): LogLevelCounts {
   return counts;
 }
 
-function matches(entry: ServerLogEntry, levels: Set<ServerLogLevel> | null, needle: string | null, provider: string | null): boolean {
-  if (levels && !levels.has(entry.level)) return false;
-  if (provider !== null && entry.provider !== provider) return false;
-  if (needle !== null) {
+interface LogFilters {
+  levels: Set<ServerLogLevel> | null;
+  needle: string | null;
+  provider: string | null;
+  event: string | null;
+}
+
+function matches(entry: ServerLogEntry, filters: LogFilters): boolean {
+  if (filters.levels && !filters.levels.has(entry.level)) return false;
+  if (filters.provider !== null && entry.provider !== filters.provider) return false;
+  if (filters.event !== null && entry.event !== filters.event) return false;
+  if (filters.needle !== null) {
     const haystack = `${entry.message} ${entry.provider ?? ''} ${entry.source ?? ''} ${entry.event ?? ''}`.toLowerCase();
-    if (!haystack.includes(needle)) return false;
+    if (!haystack.includes(filters.needle)) return false;
   }
   return true;
 }
@@ -455,9 +513,12 @@ export function queryLogs(query: LogQuery = {}): ServerLogEntry[] {
   // A caller already caught up costs one comparison, not a scan.
   if (sinceId !== undefined && sinceId >= lastId) return [];
 
-  const levels = query.levels && query.levels.length > 0 ? new Set(query.levels) : null;
-  const needle = query.q && query.q.trim() !== '' ? query.q.trim().toLowerCase() : null;
-  const provider = query.provider && query.provider.trim() !== '' ? query.provider.trim() : null;
+  const filters: LogFilters = {
+    levels: query.levels && query.levels.length > 0 ? new Set(query.levels) : null,
+    needle: query.q && query.q.trim() !== '' ? query.q.trim().toLowerCase() : null,
+    provider: query.provider && query.provider.trim() !== '' ? query.provider.trim() : null,
+    event: query.event && query.event.trim() !== '' ? query.event.trim() : null,
+  };
   const limit = clampLimit(query.limit);
 
   const out: ServerLogEntry[] = [];
@@ -465,7 +526,7 @@ export function queryLogs(query: LogQuery = {}): ServerLogEntry[] {
   for (let i = ring.length - 1; i >= 0 && out.length < limit; i--) {
     const entry = ring[i]!;
     if (sinceId !== undefined && entry.id <= sinceId) break;
-    if (matches(entry, levels, needle, provider)) out.push(entry);
+    if (matches(entry, filters)) out.push(entry);
   }
   return out.reverse();
 }
@@ -493,6 +554,9 @@ export function resetServerLogsForTest(): void {
   seeding = false;
   mirroring = false;
   persisting = false;
+  persistWindowStartMs = 0;
+  persistWindowCount = 0;
+  persistSuppressed = 0;
 }
 
 /** Test/introspection seam: the ring exactly as stored. */

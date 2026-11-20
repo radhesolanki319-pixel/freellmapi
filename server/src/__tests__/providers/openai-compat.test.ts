@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import dns from 'node:dns';
-import { OpenAICompatProvider } from '../../providers/openai-compat.js';
+import { OpenAICompatProvider, inBandCreditsError, inBandErrorEnvelope } from '../../providers/openai-compat.js';
+import { stubPublicDns } from '../helpers/dns.js';
+
+// Fake relay hosts must resolve for the URL guard (#1875).
+beforeEach(() => stubPublicDns());
 
 describe('OpenAICompatProvider', () => {
   let provider: OpenAICompatProvider;
@@ -302,6 +306,27 @@ describe('OpenAICompatProvider', () => {
     ).rejects.toThrow(/Too many requests/);
   });
 
+  it('treats a 200 carrying only an error envelope as a 503, not an empty answer (cheapllm.shop busy queue)', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: () => Promise.resolve({ error: { message: 'The kitchen is packed right now', type: 'server_overloaded', code: 'overloaded' } }),
+    } as any);
+
+    const err = await provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model').catch(e => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.status).toBe(503);
+    expect(err.message).toMatch(/API error 503: The kitchen is packed/);
+  });
+
+  it('maps in-body error envelopes by code and leaves real answers alone', () => {
+    expect(inBandErrorEnvelope({ error: { message: 'slow down', code: 'rate_limit_exceeded' } })?.status).toBe(429);
+    expect(inBandErrorEnvelope({ error: { message: 'boom' } })?.status).toBe(502);
+    expect(inBandErrorEnvelope({ choices: [{ message: { content: 'hi' } }], error: { message: 'ignored' } })).toBeNull();
+    expect(inBandErrorEnvelope({ choices: [] })).toBeNull();
+  });
+
   it('explains a non-JSON 200 body instead of surfacing the raw parse error (#189)', async () => {
     // e.g. a custom base URL pointing at Ollama's native NDJSON /api endpoint:
     // real fetch's res.json() rejects with "Unexpected non-whitespace character
@@ -402,6 +427,27 @@ describe('OpenAICompatProvider', () => {
 
   it('should validate key using models endpoint', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, status: 200 } as any);
+    expect(await provider.validateKey('valid')).toBe(true);
+  });
+
+  it('validateKey treats a 200 that is not JSON as an error, not a healthy key (#1557)', async () => {
+    // Retired GitHub Models answered every path with 200 "OK" in plain text.
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'text/plain' }),
+      text: () => Promise.resolve('OK\n'),
+    } as any);
+    await expect(provider.validateKey('any')).rejects.toThrow(/did not answer JSON/);
+  });
+
+  it('validateKey accepts a JSON model list', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      text: () => Promise.resolve('{"object":"list","data":[]}'),
+    } as any);
     expect(await provider.validateKey('valid')).toBe(true);
   });
 
@@ -1037,5 +1083,304 @@ describe('reasoning: request knob + <think> extraction (P2 #16)', () => {
     expect(chunks).toHaveLength(4);
     expect(chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('')).toBe('Hello world');
     expect(chunks.some(c => (c.choices?.[0]?.delta as any)?.reasoning_content != null)).toBe(false);
+  });
+});
+
+describe('OpenAICompatProvider in-band out-of-credits notice (#pollinations-inband)', () => {
+  // The canned Pollinations top-up message returned as a 200 body.
+  const CREDITS = "The account behind this API key doesn't have enough credits. " +
+    'Please top up (https://enter.pollinations.ai/top-up?ref=agent_low_balance_topup) or ' +
+    'complete a quest (https://enter.pollinations.ai/quests?ref=agent_low_balance_quests), then try again.';
+
+  afterEach(() => vi.restoreAllMocks());
+
+  const provider = () => new OpenAICompatProvider({ platform: 'groq', name: 'Pollinations', baseUrl: 'https://x/v1' });
+
+  function sse(frames: string[]): any {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const f of frames) controller.enqueue(encoder.encode(f));
+        controller.close();
+      },
+    });
+    return { ok: true, body: stream, headers: new Headers() };
+  }
+  const dataFrame = (delta: Record<string, unknown>, finish: string | null = null) =>
+    `data: ${JSON.stringify({ id: 's1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+  async function collect<T>(g: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const c of g) out.push(c);
+    return out;
+  }
+
+  describe('inBandCreditsError', () => {
+    it('flags the Pollinations notice and a truncated prefix of it', () => {
+      expect(inBandCreditsError(CREDITS)).toBeTruthy();
+      expect(inBandCreditsError("doesn't have enough credits. Please top up")).toBeTruthy();
+    });
+    it('does not flag a genuine reply that merely mentions credits', () => {
+      expect(inBandCreditsError("You don't need enough credits upfront — just enable billing.")).toBeNull();
+      expect(inBandCreditsError('Here is a poem about the ocean.')).toBeNull();
+      expect(inBandCreditsError('')).toBeNull();
+      expect(inBandCreditsError(undefined)).toBeNull();
+    });
+  });
+
+  it('non-stream: throws a payment-required error instead of returning the notice', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      headers: new Headers(),
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: CREDITS }, finish_reason: 'stop' }],
+      }),
+    }) as any);
+    await expect(provider().chatCompletion('k', [{ role: 'user', content: 'q' }], 'm'))
+      .rejects.toThrow(/402|insufficient credit/i);
+  });
+
+  it('non-stream: a normal reply is returned unchanged', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => ({
+      ok: true,
+      headers: new Headers(),
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hello there' }, finish_reason: 'stop' }],
+      }),
+    }) as any);
+    const res = await provider().chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    expect(res.choices[0].message.content).toBe('hello there');
+  });
+
+  it('stream: throws before yielding any chunk when the body is a credits notice', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: CREDITS }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    await expect(collect(provider().streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm')))
+      .rejects.toThrow(/402|insufficient credit/i);
+  });
+
+  it('stream: a normal reply passes through unchanged', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: 'Hello ' }),
+      dataFrame({ content: 'world' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const chunks = await collect(provider().streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    expect(chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('')).toBe('Hello world');
+  });
+});
+
+describe('pinned tool_choice retry on custom endpoints (#1548)', () => {
+  const custom = () => new OpenAICompatProvider({ platform: 'custom', name: 'Custom', baseUrl: 'http://127.0.0.1:1234/v1' });
+  const moveNote = { type: 'function' as const, function: { name: 'move_note', description: 'Move a note', parameters: { type: 'object', properties: { folder: { type: 'string' } }, required: ['folder'] } } };
+  const tagNote = { type: 'function' as const, function: { name: 'tag_note', description: 'Tag a note', parameters: { type: 'object', properties: { tag: { type: 'string' } } } } };
+  const pinned = { type: 'function' as const, function: { name: 'move_note' } };
+  const messages = [{ role: 'user' as const, content: 'File this note under Finance.' }];
+  const badRequest = () => ({ ok: false, status: 400, statusText: 'Bad Request', json: () => Promise.resolve({}) }) as any;
+  const toolCallResponse = () => ({
+    ok: true,
+    json: () => Promise.resolve({
+      id: 'x', object: 'chat.completion', created: 1, model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'move_note', arguments: '{"folder":"Finance"}' } }] }, finish_reason: 'tool_calls' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  }) as any;
+  const toolCallStream = () => {
+    const frames = [
+      'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"move_note","arguments":"{\\"folder\\":\\"Finance\\"}"}}]},"finish_reason":null}]}\n\n',
+      'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    });
+    return { ok: true, status: 200, body, headers: new Headers() } as any;
+  };
+
+  /** Answer each request with the next response and record every request body. */
+  function upstream(...responses: Array<() => any>) {
+    const bodies: any[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+      bodies.push(JSON.parse((init as any).body));
+      const next = responses[bodies.length - 1];
+      if (!next) throw new Error(`unexpected request #${bodies.length}`);
+      return next();
+    });
+    return bodies;
+  }
+
+  let log: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    log = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('sends the object form first and does not retry when the endpoint accepts it', async () => {
+    const bodies = upstream(toolCallResponse);
+    const r = await custom().chatCompletion('k', messages, 'm', { tools: [moveNote, tagNote], tool_choice: pinned });
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].tool_choice).toEqual(pinned);
+    expect(bodies[0].tools).toEqual([moveNote, tagNote]);
+    expect(r.choices[0].message.tool_calls?.[0].function.name).toBe('move_note');
+  });
+
+  it('non-stream: retries a 400 once with "required" over only the pinned tool', async () => {
+    const bodies = upstream(badRequest, toolCallResponse);
+    const r = await custom().chatCompletion('k', messages, 'm', { tools: [moveNote, tagNote], tool_choice: pinned, max_tokens: 300 });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1].tool_choice).toBe('required');
+    expect(bodies[1].tools).toEqual([moveNote]);
+    expect(bodies[1].messages).toEqual(bodies[0].messages);
+    expect(bodies[1].max_tokens).toBe(bodies[0].max_tokens);
+    expect(r.choices[0].message.tool_calls?.[0].function).toEqual({ name: 'move_note', arguments: '{"folder":"Finance"}' });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('#1548'));
+  });
+
+  it('stream: retries a 400 once with "required" over only the pinned tool', async () => {
+    const bodies = upstream(badRequest, toolCallStream);
+    const chunks: any[] = [];
+    for await (const c of custom().streamChatCompletion('k', messages, 'm', { tools: [moveNote, tagNote], tool_choice: pinned })) chunks.push(c);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].tool_choice).toEqual(pinned);
+    expect(bodies[1].tool_choice).toBe('required');
+    expect(bodies[1].tools).toEqual([moveNote]);
+    expect(bodies[1].stream).toBe(true);
+    const calls = chunks.flatMap(c => c.choices[0]?.delta?.tool_calls ?? []);
+    expect(calls[0].function.name).toBe('move_note');
+  });
+
+  const rejected = (message: string) => () => ({ ok: false, status: 400, statusText: 'Bad Request', json: () => Promise.resolve({ error: { message } }) }) as any;
+
+  it('non-stream: throws the retry error when the rewritten request is rejected too, without a third attempt', async () => {
+    const bodies = upstream(rejected('first rejection'), rejected('retry rejection'));
+    await expect(custom().chatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: pinned })).rejects.toThrow('Custom API error 400: retry rejection');
+    expect(bodies).toHaveLength(2);
+  });
+
+  it('stream: throws the retry error when the rewritten request is rejected too, without a third attempt', async () => {
+    const bodies = upstream(rejected('first rejection'), rejected('retry rejection'));
+    const drain = async () => {
+      for await (const _ of custom().streamChatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: pinned })) { /* drain */ }
+    };
+    await expect(drain()).rejects.toThrow('Custom API error 400: retry rejection');
+    expect(bodies).toHaveLength(2);
+  });
+
+  it('does not retry when tool_choice is already a string', async () => {
+    const bodies = upstream(badRequest);
+    await expect(custom().chatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: 'required' })).rejects.toThrow('Custom API error 400');
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('does not retry when the pinned function is not among the tools', async () => {
+    const bodies = upstream(badRequest);
+    await expect(custom().chatCompletion('k', messages, 'm', { tools: [tagNote], tool_choice: pinned })).rejects.toThrow('Custom API error 400');
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('does not retry errors other than 400', async () => {
+    const bodies = upstream(() => ({ ok: false, status: 500, statusText: 'Internal Server Error', json: () => Promise.resolve({}) }) as any);
+    await expect(custom().chatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: pinned })).rejects.toThrow('Custom API error 500');
+    expect(bodies).toHaveLength(1);
+  });
+
+  it('does not retry built-in platforms', async () => {
+    const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+    const bodies = upstream(badRequest);
+    await expect(groq.chatCompletion('k', messages, 'm', { tools: [moveNote], tool_choice: pinned })).rejects.toThrow('Groq API error 400');
+    expect(bodies).toHaveLength(1);
+  });
+});
+
+describe('OpenCode session header (#1639)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function upstream() {
+    return vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      (global as any).__lastHeaders = (init as any).headers;
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'x', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+  }
+
+  it('carries a stable x-opencode-session on chat completions', async () => {
+    const zen = new OpenAICompatProvider({ platform: 'custom', name: 'OpenCode Go', baseUrl: 'https://opencode.ai/zen/go/v1' });
+    const spy = upstream();
+    await zen.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'glm-5.3');
+    const first = (global as any).__lastHeaders['x-opencode-session'];
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    await zen.chatCompletion('k', [{ role: 'user', content: 'hi again' }], 'glm-5.3');
+    expect((global as any).__lastHeaders['x-opencode-session']).toBe(first);
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it('derives a different session per credential, stably', async () => {
+    const zen = new OpenAICompatProvider({ platform: 'custom', name: 'OpenCode Go', baseUrl: 'https://opencode.ai/zen/go/v1' });
+    upstream();
+    await zen.chatCompletion('key-one', [{ role: 'user', content: 'hi' }], 'm');
+    const one = (global as any).__lastHeaders['x-opencode-session'];
+    await zen.chatCompletion('key-two', [{ role: 'user', content: 'hi' }], 'm');
+    const two = (global as any).__lastHeaders['x-opencode-session'];
+    expect(one).not.toBe(two);
+    const zen2 = new OpenAICompatProvider({ platform: 'custom', name: 'OpenCode Go', baseUrl: 'https://opencode.ai/zen/go/v1' });
+    await zen2.chatCompletion('key-one', [{ role: 'user', content: 'hi' }], 'm');
+    expect((global as any).__lastHeaders['x-opencode-session']).toBe(one);
+  });
+
+  it('carries the header on the streaming path too, and stays off other endpoints', async () => {
+    const frames = ['data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n', 'data: [DONE]\n\n'];
+    const encoder = new TextEncoder();
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      (global as any).__lastHeaders = (init as any).headers;
+      const stream = new ReadableStream<Uint8Array>({ start(c) { for (const f of frames) c.enqueue(encoder.encode(f)); c.close(); } });
+      return {
+        ok: true, body: stream, headers: new Headers(),
+        json: () => Promise.resolve({
+          id: 'x', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any;
+    });
+    const zen = new OpenAICompatProvider({ platform: 'custom', name: 'OpenCode Go', baseUrl: 'https://zen.opencode.ai/v1' });
+    for await (const _chunk of zen.streamChatCompletion('k', [{ role: 'user', content: 'hi' }], 'm')) { /* drain */ }
+    expect((global as any).__lastHeaders['x-opencode-session']).toMatch(/^[0-9a-f-]{36}$/);
+
+    const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+    await groq.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
+    expect((global as any).__lastHeaders['x-opencode-session']).toBeUndefined();
+  });
+
+  it('does not send the header on the models health check, which opencode answers without it', async () => {
+    const zen = new OpenAICompatProvider({ platform: 'custom', name: 'OpenCode Go', baseUrl: 'https://opencode.ai/zen/go/v1' });
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      (global as any).__lastHeaders = (init as any).headers;
+      return { ok: true, status: 200, headers: new Headers(), json: () => Promise.resolve({ data: [] }) } as any;
+    });
+    await zen.validateKey?.('k');
+    if ((global as any).__lastHeaders) {
+      expect((global as any).__lastHeaders['x-opencode-session']).toBeUndefined();
+    }
   });
 });

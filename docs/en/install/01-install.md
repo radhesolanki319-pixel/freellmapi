@@ -25,7 +25,7 @@ curl -fsSL https://freellmapi.co/install.sh | bash
 
 Prefer to read before you pipe to bash? [The script is here](https://freellmapi.co/install.sh). Re-running it is safe: your `.env` (and encryption key) is preserved and the container updates to `:latest`. Override the defaults with `FREELLMAPI_DIR`, `PORT`, or `HOST_BIND` env vars.
 
-On Windows, the easiest path is the desktop **[`.exe` installer from Releases](https://github.com/tashfeenahmed/freellmapi/releases/latest)** ([below](#desktop-app)); the Docker steps work in WSL or any bash shell.
+On Windows, the easiest path is the desktop app from the **[Microsoft Store](https://apps.microsoft.com/detail/9PBN6G8K2B7F)** (signed, so Smart App Control allows it, and updated by the Store), or the unsigned **[`.exe` installer from Releases](https://github.com/tashfeenahmed/freellmapi/releases/latest)** ([below](#desktop-app)); the Docker steps work in WSL or any bash shell.
 
 On Android, see the experimental [Termux installation guide](02-android-termux.md). It uses Node's built-in SQLite driver and does not require the Android NDK.
 
@@ -145,6 +145,10 @@ before rotating.
 Request analytics are retained for 90 days or 100000 request rows by default,
 whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or
 `REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
+The provider quota history (`provider_quota_observations`) is kept for 7 days
+or 50000 rows by default; tune it with `QUOTA_OBSERVATIONS_RETENTION_DAYS` and
+`QUOTA_OBSERVATIONS_MAX_ROWS`. Pruning frees pages inside the database file but
+does not shrink it; run `VACUUM` while the app is stopped to reclaim disk space.
 
 Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
 
@@ -167,6 +171,8 @@ instead of duplicated.
 
 ```json
 {
+  "admin": { "email": "ops@example.com", "password": "change-me-min-8-chars" },
+  "license": "premium license key from freellmapi.co",
   "keys": [
     { "platform": "groq", "key": "gsk_...", "label": "main" },
     { "platform": "google", "key": "AIza...", "enabled": true }
@@ -193,6 +199,24 @@ instead of duplicated.
 }
 ```
 
+Two optional top-level fields cover first-run provisioning:
+
+- **`admin`** creates the first dashboard account, but only while no account
+  exists — a claimed install ignores the entry with a warning, so the config
+  can never take it over. Because the config is applied before the HTTP
+  listener starts, an `admin` entry also closes the unauthenticated
+  first-run setup window entirely: no setup code is minted and
+  `POST /api/auth/setup` answers 409 from the first request on.
+- **`license`** is a Premium key from freellmapi.co. It is validated against
+  the license service before being stored — the same contract as the
+  dashboard's Premium page — then a live-tier catalog sync starts right away.
+  Activation runs in the background so an unreachable license service never
+  delays boot; a stored key identical to the configured one short-circuits
+  before any network call, and a changed key re-activates (rotation).
+
+The config carries plaintext secrets (provider keys, the admin password, the
+license key), so protect the file or env value exactly like `ENCRYPTION_KEY`.
+
 If two custom endpoints serve the same model id, add `"endpoint"` to a `models`
 or `fallback` entry to say which one you mean — the endpoint's URL, or the short
 handle the dashboard shows next to it. Without it, an entry that matches more
@@ -214,7 +238,7 @@ FreeLLMAPI publishes a single production image that contains the Express server 
 docker pull ghcr.io/tashfeenahmed/freellmapi:latest   # or pin a release, e.g. :v1.2.3
 ```
 
-The image is multi-arch (`linux/amd64` + `linux/arm64`, so it runs on a Raspberry Pi). Published tags: `latest` (default branch), `v*.*.*` (git release tags), and `sha-<commit>`.
+The image is multi-arch (`linux/amd64` + `linux/arm64`, so it runs on a Raspberry Pi). Published tags: `latest` (the newest release), `main` (the default branch), `v*.*.*` (git release tags), and `sha-<commit>`.
 
 The included `docker-compose.yml` is the recommended install path:
 
@@ -222,6 +246,14 @@ The included `docker-compose.yml` is the recommended install path:
 docker compose up -d
 docker compose logs -f freellmapi
 ```
+
+**Updating:** `docker compose pull && docker compose up -d` (your volume and `.env` carry over). To update from the dashboard instead, set `WATCHTOWER_TOKEN` in `.env` (e.g. `openssl rand -hex 32`) and start with the opt-in profile:
+
+```bash
+docker compose --profile autoupdate up -d
+```
+
+Settings → **Check for updates** then shows **Update now** when a newer release exists: a [Watchtower](https://github.com/nicholas-fedor/watchtower) sidecar pulls the image and recreates the `freellmapi` container, and the dashboard reloads when it is back. Watchtower runs with only its token-protected update endpoint, never updates on a schedule, publishes no port and only touches the `freellmapi` container — but it mounts the Docker socket, which is root-equivalent on the host, so the profile stays off unless you start it.
 
 By default the container's port is bound to `127.0.0.1` (localhost only). To reach the dashboard/API from another machine on your network, publish it on all interfaces with `HOST_BIND=0.0.0.0 docker compose up -d` — only on a trusted LAN, since the proxy is single-user.
 
@@ -258,15 +290,20 @@ request stats.
 
 ![FreeLLMAPI desktop app](../../../repo-assets/desktop.png)
 
-**[Download from Releases](https://github.com/tashfeenahmed/freellmapi/releases/latest)** — the macOS `.dmg` and the Windows `.exe` installer are built and attached to every release by the [`desktop-release`](../../../.github/workflows/desktop-release.yml) workflow. Or build it from this repo in a few minutes:
+**[Get it from the Microsoft Store](https://apps.microsoft.com/detail/9PBN6G8K2B7F)** on Windows, or **[download from Releases](https://github.com/tashfeenahmed/freellmapi/releases/latest)** — the macOS `.dmg` and the Windows `.exe` installer are built and attached to every release by the [`desktop-release`](../../../.github/workflows/desktop-release.yml) workflow. Or build it from this repo in a few minutes:
+
+**Mac downloads:** choose `arm64` for Apple Silicon or `x64` for Intel. Both require macOS 12 Monterey or later and include DMG and ZIP downloads.
+
+**Updating:** the installed app updates itself on macOS, on Windows (the `Setup` installer) and from the Linux AppImage. **⋯ → Settings → Check for updates** (or the tray's **Check for Updates…**) downloads the new release and offers **Restart to update**; a full database backup, listed as *Pre-update* on the Backups page, is written before it installs. With **Automatic update check** on, new releases download in the background and install on the next restart or quit; the app never restarts on its own. The Linux `.deb`/`.rpm`/`.tar.xz` and the portable Windows `.zip` update by downloading the new release.
 
 > **Note for Windows users building from source:** Building the desktop app requires compiling native SQLite modules for Electron. You must have [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) installed (specifically the "Desktop development with C++" workload) and Python installed before running `npm install`.
 
 ```bash
 npm install
 npm install --prefix desktop  # install desktop dependencies
-npm run desktop:dist          # macOS  → desktop/dist-electron/FreeLLMAPI-…-arm64.dmg
-npm run desktop:dist:win      # Windows → "desktop/dist-electron/FreeLLMAPI Setup ….exe"
+npm run desktop:dist          # macOS  → desktop/dist-electron/FreeLLMAPI-…-macos-arm64.dmg
+npm run desktop:dist:mac:x64  # Intel Mac → desktop/dist-electron/FreeLLMAPI-…-macos-x64.dmg
+npm run desktop:dist:win      # Windows → "desktop/dist-electron/FreeLLMAPI-Setup-….exe"
 ```
 
 > Locally built apps are unsigned, so Windows SmartScreen may warn on first run
@@ -311,6 +348,9 @@ install. For the server (non-desktop) deployment, the equivalent state is the
 **Desktop app — there is no password.** The dashboard signs itself in with a
 hidden local account, so there is nothing to remember and nothing to reset. If
 you cannot see the dashboard, open it from the tray icon → **Open Dashboard**.
+A browser tab on the same computer (for example http://127.0.0.1:31415) signs in
+the same way. Only another device reaching the app over LAN access is asked to
+sign in.
 
 **Server installs** (Docker, one-liner, `npm run dev`) do have an email +
 password account, and there is no email delivery to send a reset link to. The

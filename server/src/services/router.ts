@@ -6,6 +6,7 @@ import {
   canMakeRequest,
   canUseTokens,
   isOnCooldown,
+  getCooldownSource,
   canUseProvider,
   canUseProviderMinute,
   canUseProviderTokens,
@@ -16,7 +17,7 @@ import {
   modelWindowUsedFraction,
 } from './ratelimit.js';
 import {
-  BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
+  BANDIT_PRESETS, DEFAULT_STRATEGY, type PresetStrategy, type RoutingStrategy, type RoutingWeights,
   type KeySelectionStrategy,
   reliabilityPosterior, expectedReliability, sampleBeta,
   speedScore, intelligenceScore, intelligenceComposite, headroomFactor, rateWindowHeadroomFactor,
@@ -26,16 +27,21 @@ import {
   observedSpeedRank, TIMEOUT_LATENCY_CAP_MS,
   type HeadroomThresholds,
 } from './scoring.js';
-import { TIMEOUT_ERROR_MARKERS } from '../lib/error-classify.js';
+import { TIMEOUT_ERROR_MARKERS, isProviderMomentFailure } from '../lib/error-classify.js';
+import { checkMonthlyBudget, reserveMonthlyBudget } from './key-budget.js';
+import { cloudflareNeuronsAvailable } from './cloudflare-neurons.js';
 import { applyModelWeightOverride, getModelWeightOverrides } from './model-weight-overrides.js';
-import { modelsWithOverriddenField } from './model-state.js';
+import { modelsWithOverriddenField, getCatalogModelTombstone } from './model-state.js';
 import { parseBudget } from '../lib/budget.js';
 import { platformDropsResponseFormat } from '../lib/sampling-params.js';
+import { passesContextWindowFloor } from '../lib/min-context-window.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from './model-groups.js';
 import { getActiveProfileId } from './profile-models.js';
+import { getClientContext } from '../lib/client-context.js';
 import { customEndpointKeyIds } from './custom-endpoint.js';
 import { isDegraded } from './degradation.js';
 import { modelStatsKey, endpointScopeForBaseUrl } from '../lib/endpoint-scope.js';
+import { isToolBenched } from '../lib/tool-capability.js';
 import { parseModelScope, scopeAllows } from '../lib/model-scope.js';
 import { getKeyQuotaHeadroom, inferQuotaPoolKey } from './provider-quota.js';
 import type { BaseProvider } from '../providers/base.js';
@@ -179,6 +185,13 @@ export interface ChainRow {
    * answering on score alone would be a silent substitution (#651).
    */
   match_tier?: number;
+  /**
+   * The routing preset this row's chain carries (profiles.routing_strategy), or
+   * null/absent to inherit the global strategy. Selected together with the chain
+   * rows so routeRequest can rank by the chain's own preset without a second
+   * query, and without widening routeRequest's signature.
+   */
+  profile_strategy?: string | null;
 }
 
 export interface RouteResult {
@@ -196,6 +209,7 @@ export interface RouteResult {
   keyLabel: string | null;
   platform: string;
   displayName: string;
+  contextWindow: number | null;
   /**
    * The custom endpoint this route belongs to, '' for catalog platforms (#651).
    * Carried on the route so the failure path can attribute a retirement signal
@@ -403,6 +417,73 @@ export function setHeadroomThresholds(rampStart?: number | null, floor?: number 
   apply(HEADROOM_FLOOR_KEY, floor);
 }
 
+// ── Minimum reliability floor (#filter) ─────────────────────────────────────
+// Operators who keep hitting models/keys with a high error rate can set a floor
+// (0..1 decimal, e.g. 0.8 = drop anything observed below 80% success). Only
+// models with enough live samples are judged; under-observed ones stay in the
+// exploration pool so cold-start models are never silently killed. Absent/invalid
+// values disable the filter (existing installs untouched).
+export const MIN_RELIABILITY_FLOOR_KEY = 'routing_min_reliability_floor';
+
+export function getMinReliabilityFloor(): number | undefined {
+  const raw = getSetting(MIN_RELIABILITY_FLOOR_KEY);
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : undefined;
+}
+
+// null clears the floor back to the default (disabled); undefined leaves it untouched.
+export function setMinReliabilityFloor(floor?: number | null): void {
+  if (floor === undefined) return;
+  if (floor === null) {
+    getDb().prepare('DELETE FROM settings WHERE key = ?').run(MIN_RELIABILITY_FLOOR_KEY);
+    return;
+  }
+  if (!Number.isFinite(floor) || floor < 0 || floor > 1) {
+    throw new Error(`Invalid value ${floor} for ${MIN_RELIABILITY_FLOOR_KEY} (must be 0..1)`);
+  }
+  setSetting(MIN_RELIABILITY_FLOOR_KEY, String(floor));
+}
+
+// ── Provider-moment failure attribution (opt-in, #1347) ────────────────────
+// When on, a failed attempt whose cause is a provider moment (429 / 5xx /
+// timeout / transport) is tagged `failure_attribution = 'provider_moment'`
+// instead of being scored as model evidence: it still steers the key (the
+// cooldown ladder is untouched), but it drops out of the reliability stats
+// and the model-level failure penalties. Off by default, so existing
+// installs keep the exact current scoring. The env var wins over the
+// dashboard setting so a self-host can pin the behaviour without the UI.
+export const PROVIDER_MOMENT_ATTRIBUTION_KEY = 'routing_provider_moment_attribution';
+
+export function isProviderMomentAttributionEnabled(): boolean {
+  const env = process.env.ROUTER_PROVIDER_MOMENT_ATTRIBUTION;
+  if (env !== undefined && env.trim() !== '') {
+    const v = env.trim().toLowerCase();
+    if (v === '1' || v === 'true' || v === 'on') return true;
+    if (v === '0' || v === 'false' || v === 'off') return false;
+  }
+  return getSetting(PROVIDER_MOMENT_ATTRIBUTION_KEY) === '1';
+}
+
+export function setProviderMomentAttribution(enabled: boolean): void {
+  if (enabled) {
+    setSetting(PROVIDER_MOMENT_ATTRIBUTION_KEY, '1');
+  } else {
+    getDb().prepare('DELETE FROM settings WHERE key = ?').run(PROVIDER_MOMENT_ATTRIBUTION_KEY);
+  }
+  // The stats cache bakes the attribution filter into its SQL, so a toggle
+  // must not wait for the cache TTL to change routing.
+  refreshStatsCache(getDb(), true);
+}
+
+// The failure_attribution value for one attempt error, or null when the
+// feature is off or the error is not a provider-moment failure. Route call
+// sites pass this straight through to logRequest.
+export function failureAttributionFor(err: any): string | null {
+  if (!isProviderMomentAttributionEnabled()) return null;
+  return isProviderMomentFailure(err) ? 'provider_moment' : null;
+}
+
 // ── Task-type weight share (persisted) ─────────────────────────────────────
 // #1127 follow-up: the bandit bias applied for a declared/derived task type
 // moves `share` of one axis onto the other (code: speed → intelligence; chat:
@@ -438,7 +519,7 @@ export const EXPLORE_CHANCE = 0.1;
 /** A model counts as "has data" once its decay-weighted success+failure
  *  pseudo-count reaches this many samples. */
 export const EXPLORE_MIN_SAMPLES = 5;
-const VALID_STRATEGIES: RoutingStrategy[] = ['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom'];
+const VALID_STRATEGIES: RoutingStrategy[] = ['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom', 'decision'];
 
 export function getRoutingStrategy(): RoutingStrategy {
   const raw = getSetting(STRATEGY_KEY);
@@ -680,7 +761,19 @@ export function setCommunityPriors(priors: CommunityPriorMap): number {
 function weightsWithPeak(strategy: RoutingStrategy): { weights: RoutingWeights | null; adjusted: boolean } {
   if (strategy === 'priority') return { weights: null, adjusted: false };
   if (strategy === 'custom') return { weights: getCustomWeights(), adjusted: false };
+  // 'decision' outside a picked request (display, fusion, background) scores
+  // as Balanced, the same preset an unsure or unavailable decision falls to.
+  if (strategy === 'decision') return weightsWithPeak('balanced');
   return peakAdjustedWeights(BANDIT_PRESETS[strategy], strategy, getPeakHoursConfig());
+}
+
+/** The strategy THIS request routes with. Under 'decision' (#1354) that is the
+ *  preset the decision model picked for the request, else Balanced; every
+ *  other strategy is used as set. */
+export function effectiveRoutingStrategy(): RoutingStrategy {
+  const strategy = getRoutingStrategy();
+  if (strategy !== 'decision') return strategy;
+  return getClientContext().routingStrategy ?? 'balanced';
 }
 
 function weightsFor(strategy: RoutingStrategy): RoutingWeights | null {
@@ -773,6 +866,13 @@ export function refreshStatsCache(db: Db, force = false): void {
   // count × ≤7 day buckets — so the finer grain keeps the same one-query,
   // 60s-cached shape. Aggregated two ways below: rolled up per model (ordering)
   // and per key (in-model key selection, #580).
+  // #1347 (PR 1): with provider-moment attribution on, tagged rows are the
+  // provider's bad minute, not the model — keep them out of every aggregate
+  // here (reliability denominator, timeouts, speed) exactly like 'canceled'
+  // rows are kept out today.
+  const pmExcluded = isProviderMomentAttributionEnabled()
+    ? " AND (failure_attribution IS NULL OR failure_attribution <> 'provider_moment')"
+    : '';
   const buckets = db.prepare(`
     SELECT platform, model_id, key_id,
       CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS age_days,
@@ -785,7 +885,7 @@ export function refreshStatsCache(db: Db, force = false): void {
       SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN 1 ELSE 0 END) AS timeouts,
       SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN MIN(MAX(latency_ms, 0), ${TIMEOUT_LATENCY_CAP_MS}) ELSE 0 END) AS timeout_lat
     FROM requests
-    WHERE created_at >= ? AND status <> 'canceled'
+    WHERE created_at >= ? AND status <> 'canceled'${pmExcluded}
     GROUP BY platform, model_id, key_id, age_days
   `).all(since) as Array<{
     platform: string; model_id: string; key_id: number | null; age_days: number; total: number; successes: number;
@@ -980,11 +1080,22 @@ interface ScoredEntry {
 // must scale to match or the headroom guardrail damps a multi-key model to the
 // floor after just one account's worth of tokens.
 function usableKeyCountsByPlatform(db: Db): Map<string, number> {
+  // Per-request GROUP BY on api_keys; only changes on key writes. Real-time
+  // correctness is backed by selectKeyForModel's live per-key checks — a stale
+  // count can at worst walk one extra candidate, never route to a dead key.
+  // ponytail: 5s TTL instead of write-point invalidation; per-write hooks if that ever matters.
+  if (cachesEnabled() && keyCountsCache && keyCountsCache.db === db && Date.now() - keyCountsCache.at < KEY_COUNTS_TTL_MS) {
+    return keyCountsCache.map;
+  }
   const rows = db.prepare(
     "SELECT platform, COUNT(*) AS count FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform"
   ).all() as { platform: string; count: number }[];
-  return new Map(rows.map(r => [r.platform, r.count]));
+  const map = new Map(rows.map(r => [r.platform, r.count]));
+  keyCountsCache = { db, at: Date.now(), map };
+  return map;
 }
+const KEY_COUNTS_TTL_MS = 5_000;
+let keyCountsCache: { db: Db; at: number; map: Map<string, number> } | null = null;
 
 function scoreChainEntry(
   entry: ChainRow,
@@ -1056,6 +1167,37 @@ function scoreChainEntry(
 }
 
 /**
+ * Drop models whose observed success rate sits below the operator's reliability
+ * floor. Under-observed models (fewer than EXPLORE_MIN_SAMPLES live samples)
+ * are kept so cold-start models stay in the exploration pool. If the floor would
+ * empty the whole chain, the filter is skipped entirely — better a possibly-flaky
+ * model than no model at all. #filter.
+ */
+export function applyReliabilityFloor(chain: ChainRow[]): ChainRow[] {
+  const floor = getMinReliabilityFloor();
+  if (floor === undefined) return chain;
+
+  const kept: ChainRow[] = [];
+  const dropped: ChainRow[] = [];
+  for (const e of chain) {
+    const stats = statsCache?.get(modelStatsKey(e.platform, e.model_id, e.endpoint_scope));
+    const total = (stats?.successes ?? 0) + (stats?.failures ?? 0);
+    if (total < EXPLORE_MIN_SAMPLES) {
+      kept.push(e); // not enough signal yet — keep exploring
+      continue;
+    }
+    const rel = expectedReliability(
+      stats!.successes, stats!.failures,
+      activeCommunityPrior(e.platform, e.model_id, e.endpoint_scope),
+    );
+    if (rel < floor) dropped.push(e);
+    else kept.push(e);
+  }
+  // Safety valve: never leave routing with an empty candidate set.
+  return kept.length > 0 ? kept : chain;
+}
+
+/**
  * Order the enabled fallback chain for routing.
  *  - 'priority' strategy → legacy manual order + 429 penalty (unchanged).
  *  - bandit strategy      → convex score, manual priority as the deterministic
@@ -1121,6 +1263,9 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true
     weights = adjusted.adjusted ? adjusted.weights : weights;
   }
 
+  // Reliability floor: drop chronically-failing models before scoring (#filter).
+  chain = applyReliabilityFloor(chain);
+
   const composites = chain.map(e => intelligenceComposite(e.size_label, e.intelligence_rank));
   const intelMin = composites.length ? Math.min(...composites) : 0;
   const intelMax = composites.length ? Math.max(...composites) : 0;
@@ -1135,26 +1280,16 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true
     .map(x => x.e);
 }
 
-/**
- * Route a request to the best available model.
- *
- * Ordering depends on the configured strategy (see orderChain). Everything
- * downstream — key round-robin, cooldowns, token pre-checks, custom base_url
- * resolution, vision filtering, sticky sessions — is strategy-independent.
- *
- * If preferredModelDbId is set, that model gets tried FIRST (sticky sessions).
- * This prevents hallucination from model switching mid-conversation.
- *
- * @param estimatedTokens - estimated total tokens for rate limit check
- * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
- * @param preferredModelDbId - try this model first (sticky session)
- * @param requireVision - only consider models that accept image input (#118)
- * @param requireTools - only consider models that emit structured tool_calls
- * @param skipPlatforms - platforms ruled out for the rest of this request (#788)
- */
 export interface ResolvedChain {
   chain: ChainRow[];
   strategyKey: string;
+  /** Set for the global-sort aliases (`auto:smart`, `auto:fast`, …): the
+   *  preset their axis maps to. routeRequest re-orders whatever chain it is
+   *  handed under the GLOBAL strategy, which silently threw the alias's
+   *  ordering away (#1628) — callers must pass this through so the request is
+   *  scored under the axis the client asked for. Absent for plain `auto` and
+   *  `auto:<chain-name>`, where the operator's global strategy is what governs. */
+  strategyOverride?: PresetStrategy;
 }
 
 const GLOBAL_SORT_ALIASES: Record<string, string> = {
@@ -1162,6 +1297,19 @@ const GLOBAL_SORT_ALIASES: Record<string, string> = {
   fast: 'fast', fastest: 'fast', speed: 'fast',
   cheap: 'cheap', cheapest: 'cheap', price: 'cheap', budget: 'cheap',
   reliable: 'reliable', reliability: 'reliable',
+  balanced: 'balanced',
+};
+
+/** The routing preset each global-sort axis stands for. Shared by the chain
+ *  sort in getChainByGlobalSort and by ResolvedChain.strategyOverride, so the
+ *  order the alias resolves to and the order routeRequest re-sorts with can
+ *  never drift apart. `auto:cheap` is budget-leaning but keeps the balanced
+ *  blend — everything in this pool is already free (see the API docs). */
+const GLOBAL_AXIS_STRATEGY: Record<string, PresetStrategy> = {
+  smart: 'smartest',
+  fast: 'fastest',
+  cheap: 'balanced',
+  reliable: 'reliable',
   balanced: 'balanced',
 };
 
@@ -1175,32 +1323,56 @@ const GLOBAL_SORT_ALIASES: Record<string, string> = {
  * (`auto:<name>`) correctly refused. `fallback_config` is the chain only for an
  * install with no profile at all.
  */
+// Chain cache: the active chain only changes on admin writes (models/profiles/
+// fallback_config), not per request — but routeRequest used to re-run the JOIN
+// on every request (synchronously, on the event loop). Cache by db+profileId
+// with a 1s TTL safety net; a profile switch changes profileId so it takes
+// effect immediately. Copy on return: callers like routeRequest splice/unshift.
+// Bypassed under NODE_ENV=test: suites write chain tables via raw SQL and route
+// immediately afterwards.
+let chainCache: { db: Db; profileId: number | null; rows: ChainRow[]; at: number } | null = null;
+const CHAIN_CACHE_TTL_MS = 1_000;
+
+function cachesEnabled(): boolean {
+  return process.env.NODE_ENV !== 'test';
+}
+
 function getActiveChain(db: Db): ChainRow[] {
   const profileId = getActiveProfileId(db);
+  if (cachesEnabled() && chainCache && chainCache.db === db && chainCache.profileId === profileId
+      && Date.now() - chainCache.at < CHAIN_CACHE_TTL_MS) {
+    return chainCache.rows.slice();
+  }
+  let rows: ChainRow[];
   if (profileId != null) {
-    return db.prepare(`
+    rows = db.prepare(`
       SELECT pm.model_db_id, pm.priority, pm.enabled,
+             p.routing_strategy AS profile_strategy,
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
              m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
       FROM profile_models pm
       JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+      JOIN profiles p ON p.id = pm.profile_id
       WHERE pm.profile_id = ?
       ORDER BY pm.priority ASC
     `).all(profileId) as ChainRow[];
+  } else {
+    rows = db.prepare(`
+      SELECT fc.model_db_id, fc.priority, fc.enabled,
+             NULL AS profile_strategy,
+             m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.size_label, m.monthly_token_budget,
+             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+      FROM fallback_config fc
+      JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
+      ORDER BY fc.priority ASC
+    `).all() as ChainRow[];
   }
-
-  return db.prepare(`
-    SELECT fc.model_db_id, fc.priority, fc.enabled,
-           m.platform, m.model_id, m.display_name, m.intelligence_rank,
-           m.size_label, m.monthly_token_budget,
-           m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
-    FROM fallback_config fc
-    JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
-    ORDER BY fc.priority ASC
-  `).all() as ChainRow[];
+  chainCache = { db, profileId, rows, at: Date.now() };
+  return rows.slice();
 }
 
 function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
@@ -1209,12 +1381,14 @@ function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
 
   return db.prepare(`
     SELECT pm.model_db_id, pm.priority, pm.enabled,
+           p.routing_strategy AS profile_strategy,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
     FROM profile_models pm
     JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
+    JOIN profiles p ON p.id = pm.profile_id
     WHERE pm.profile_id = ?
     ORDER BY pm.priority ASC
   `).all(profile.id) as ChainRow[];
@@ -1241,14 +1415,7 @@ function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
     WHERE m.enabled = 1 AND ${chainEnabled}
   `).all(...(profileId != null ? [profileId] : [])) as ChainRow[];
 
-  const strategyMap: Record<string, RoutingStrategy> = {
-    'smart': 'smartest',
-    'fast': 'fastest',
-    'cheap': 'balanced',
-    'reliable': 'reliable',
-    'balanced': 'balanced'
-  };
-  const strat = strategyMap[globalAxis] || 'balanced';
+  const strat = GLOBAL_AXIS_STRATEGY[globalAxis] ?? 'balanced';
   
   return orderChain(allEnabled, strat);
 }
@@ -1302,7 +1469,13 @@ export function resolveRoutingChain(modelString: string | undefined): ResolvedCh
       err.status = 400;
       throw err;
     }
-    return { chain, strategyKey: `auto:${globalAxis}` };
+    return {
+      chain,
+      strategyKey: `auto:${globalAxis}`,
+      // The caller must score this chain under the alias's preset, not the
+      // global one — see ResolvedChain.strategyOverride (#1628).
+      strategyOverride: GLOBAL_AXIS_STRATEGY[globalAxis] ?? 'balanced',
+    };
   }
 
   const chain = getChainByProfileName(db, suffix);
@@ -1408,6 +1581,20 @@ function orderKeysByRemainingQuota(entry: ChainRow, ordered: KeyRow[]): KeyRow[]
  * Request-level filters (vision/tools/context window) stay in the caller; this
  * only does key selection + accounting pre-checks.
  */
+// Key decryption cache: AES-GCM decrypt of every candidate key used to run on
+// each routing pass. Keyed by ciphertext — a rotated/updated key changes its
+// encrypted_key, so stale entries can never be served and there is no hook to
+// wire. ponytail: unbounded Map; a keys page refresh prunes nothing, but one
+// entry is ~64 bytes and key counts are human-scale.
+const decryptCache = new Map<number, { ct: string; plain: string }>();
+function cachedDecrypt(keyId: number, ct: string, iv: string, authTag: string): string {
+  const hit = decryptCache.get(keyId);
+  if (hit && hit.ct === ct) return hit.plain;
+  const plain = decrypt(ct, iv, authTag);
+  decryptCache.set(keyId, { ct, plain });
+  return plain;
+}
+
 function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: Set<string>, diag?: string[]): RouteResult | null {
   const db = getDb();
   const label = `${entry.platform}/${entry.model_id}`;
@@ -1417,6 +1604,14 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     return null;
   }
   const provider = getProvider(entry.platform as Platform)!;
+  // #1741: legacy rows can exist for platforms whose adapter refuses chat
+  // (registered before the gate). They can only ever fail, so drop them from
+  // the walk here instead of spending an attempt and a cooldown on each.
+  // Strictly false, not falsy: mocked providers in tests may omit the flag.
+  if (provider.supportsChat === false) {
+    diag?.push(`${label}: platform does not serve chat completions`);
+    return null;
+  }
 
   const allKeys = db.prepare(
     "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
@@ -1486,7 +1681,14 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
     if (skipKeys?.has(skipId)) { note('already-failed-this-request'); continue; }
 
-    if (isOnCooldown(entry.platform, entry.model_id, key.id)) { note('cooldown'); continue; }
+    if (isOnCooldown(entry.platform, entry.model_id, key.id)) {
+      // APINex's required website visit is not a spent token or RPM budget.
+      // Preserve this reason in zero-attempt routing diagnostics so DSH can
+      // show actionable instructions even after the initial 402 was benched.
+      const checkin = entry.platform === 'apinex' && getCooldownSource(entry.platform, entry.model_id, key.id) === 'checkin';
+      note(checkin ? 'checkin-required' : 'cooldown');
+      continue;
+    }
     if (!canUseProvider(entry.platform, key.id)) { note('provider-daily-cap'); continue; }
     // Account-wide per-minute budget, checked before the per-model gates: a model
     // with a NULL rpm_limit would otherwise sail past them and spend a budget its
@@ -1499,16 +1701,25 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     if (!canMakeRequest(entry.platform, entry.model_id, key.id, limits)) { note('rpm/rpd-limit'); continue; }
     if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) { note('tpm/tpd-limit'); continue; }
     if (!canUseProviderTokens(entry.platform, key.id, entry.model_id, estimatedTokens)) { note('provider-daily-token-cap'); continue; }
+    // Monthly budget (#1158): a key whose request/token caps are spent for the
+    // current UTC month is not a candidate — same skip semantics as the daily
+    // gates above. The Retry-After (next-month boundary) surfaces through the
+    // fallback exhaustion path rather than blocking here.
+    if (!checkMonthlyBudget(key.id, estimatedTokens).allowed) { note('monthly-budget-cap'); continue; }
 
     let decryptedKey: string;
     try {
-      decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
+      decryptedKey = cachedDecrypt(key.id, key.encrypted_key, key.iv, key.auth_tag);
     } catch {
       db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
         .run(key.id);
       note('decrypt-error');
       continue;
     }
+    // Workers AI's free neurons are per ACCOUNT, and on Workers Paid nothing
+    // upstream says when they are gone: Cloudflare bills instead. Skip a key
+    // whose account has reached today's neuron cap (services/cloudflare-neurons.ts).
+    if (entry.platform === 'cloudflare' && !cloudflareNeuronsAvailable(decryptedKey)) { note('cloudflare-neuron-cap'); continue; }
 
     const resolvedProvider = entry.platform === 'custom'
       ? resolveProvider('custom', key.base_url)
@@ -1518,6 +1729,9 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     roundRobinIndex.set(rrKey, idx);
     // Taken only once the key has cleared every gate and is definitely being
     // returned, so a rejected candidate never consumes concurrency budget.
+    const proxyUrl = decryptProxyUrl(key);
+    const budget = reserveMonthlyBudget(key.id, estimatedTokens);
+    if (!budget.allowed) { note('monthly-budget-cap'); continue; }
     const leaseId = acquireLease(entry.platform, entry.model_id, key.id, estimatedTokens);
     return {
       provider: resolvedProvider,
@@ -1527,13 +1741,14 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
       keyId: key.id,
       keyLabel: key.label || null,
       // Decrypted once here, at the point the row is already in hand (#590).
-      proxyUrl: decryptProxyUrl(key),
+      proxyUrl,
       platform: entry.platform,
       displayName: entry.display_name,
+      contextWindow: entry.context_window,
       endpointScope: entry.endpoint_scope ?? '',
       rpdLimit: limits.rpd,
       tpdLimit: limits.tpd,
-      release: () => releaseLease(leaseId),
+      release: () => { releaseLease(leaseId); budget.release(); },
     };
   }
 
@@ -1599,6 +1814,11 @@ export function hasOtherUsableKey(modelDbId: number, excludingKeyId: number, ski
     // TPM/TPD ceiling.
     if (!canUseTokens(m.platform, m.model_id, k.id, 1, limits)) continue;
     if (!canUseProviderTokens(m.platform, k.id, m.model_id, 1)) continue;
+    // Monthly budget (#1158): selectKeyForModel refuses a key whose caps are
+    // spent for the month, so it is not a usable alternative either. Without
+    // this gate a fully capped model listed `ready` on /v1/models (#1100) and
+    // a capped sibling wrongly suppressed the model-level 429 penalty (#454).
+    if (!checkMonthlyBudget(k.id, 1).allowed) continue;
     return true;
   }
   return false;
@@ -1678,30 +1898,28 @@ function getModelChainRow(db: Db, modelDbId: number): ChainRow | undefined {
  */
 export const CONTEXT_WINDOW_SAFETY_FACTOR = 1.25;
 
-// Platforms whose pre-dispatch trim guard already caps the dispatched input
-// below the live context ceiling (lib/content.ts truncateMessagesForGithub):
-// the guard — not the routing estimate — is what guarantees the fit there, so
-// applying the factor too would only make that guard unreachable. The margin
-// checks below treat these platforms as strict comparisons.
-const TRIM_GUARDED_PLATFORMS = new Set(['github']);
-
 /** True when `estimatedTokens` fits the RAW advertised window (null window =
  * unknown, never filtered — same convention as the auto-router). This is the
- * comparison /v1/models publishes and the soft-preference fallback tier. */
+ * comparison /v1/models publishes and the soft-preference fallback tier.
+ * The operator's min-context-window floor applies here too: the fallback tier
+ * must not reintroduce a model the floor excluded from the main chain. */
 export function fitsContextWindowStrict(contextWindow: number | null | undefined, estimatedTokens: number): boolean {
+  if (!passesContextWindowFloor(contextWindow)) return false;
   return contextWindow == null || estimatedTokens <= contextWindow;
 }
 
 /** True when `estimatedTokens` plausibly fits `contextWindow` WITH the safety
  * margin. The chars/4 heuristic portion is scaled by the factor; an explicit
  * output reserve derived from the client's max_tokens (`routingReserveTokens`)
- * is already an exact count and is added UNSCALED (#956 review). Trim-guarded
- * platforms compare strictly — their guard guarantees the fit. */
-export function fitsContextWindow(platform: string, contextWindow: number | null | undefined, estimatedTokens: number, exactOutputReserve = 0): boolean {
+ * is already an exact count and is added UNSCALED (#956 review). Also enforces
+ * the operator's min-context-window floor (lib/min-context-window.ts): a model
+ * below the configured preset is excluded from every chain, while an unknown
+ * window (null) always passes. */
+export function fitsContextWindow(_platform: string, contextWindow: number | null | undefined, estimatedTokens: number, exactOutputReserve = 0): boolean {
+  if (!passesContextWindowFloor(contextWindow)) return false;
   if (contextWindow == null) return true;
   // Raw advertised comparison first — the margin can only shrink eligibility.
   if (estimatedTokens > contextWindow) return false;
-  if (TRIM_GUARDED_PLATFORMS.has(platform)) return true;
   const reserve = Math.max(0, exactOutputReserve);
   const heuristic = Math.max(0, estimatedTokens - reserve);
   return heuristic * CONTEXT_WINDOW_SAFETY_FACTOR + reserve <= contextWindow;
@@ -1724,9 +1942,24 @@ export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skip
   // pre-margin behavior was one dispatch attempt (a mid-chain context_too_large
   // 400 is classified and retried downstream). Nothing is multiplied here —
   // estimatedTokens already carries the exact capped output reserve (#470).
-  if (!fitsContextWindowStrict(entry.context_window, estimatedTokens)) return null;
-  if (entry.tpm_limit != null && estimatedTokens > entry.tpm_limit) return null;
+  if (!rowFitsRequestSize(entry, estimatedTokens)) return null;
   return selectKeyForModel(entry, estimatedTokens, skipKeys);
+}
+
+function rowFitsRequestSize(entry: ChainRow, estimatedTokens: number): boolean {
+  if (!fitsContextWindowStrict(entry.context_window, estimatedTokens)) return false;
+  return entry.tpm_limit == null || estimatedTokens <= entry.tpm_limit;
+}
+
+/**
+ * Whether a pinned model's known context window and TPM ceiling can hold a
+ * request this size. Lets a caller tell "routePinnedModel returned null because
+ * the request is too big" (permanent for this request) from "no key is free
+ * right now" (transient). An unknown model is not a size problem.
+ */
+export function pinnedModelFitsRequestSize(modelDbId: number, estimatedTokens: number): boolean {
+  const entry = getModelChainRow(getDb(), modelDbId);
+  return !entry || rowFitsRequestSize(entry, estimatedTokens);
 }
 
 /**
@@ -1754,7 +1987,7 @@ export function resolveModelGroupCandidates(
   demotedDbIds?: ReadonlySet<number>,
 ): ChainRow[] {
   const db = getDb();
-  const strategy = getRoutingStrategy();
+  const strategy = effectiveRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
 
   const activeProfileId = getActiveProfileId(db);
@@ -1813,7 +2046,13 @@ export interface FusionCandidate {
  */
 export function getOrderedFusionChain(estimatedTokens: number, exactOutputReserve = 0): FusionCandidate[] {
   const db = getDb();
-  const strategy = getRoutingStrategy();
+  // effectiveRoutingStrategy, not getRoutingStrategy (#1354): under the
+  // 'decision' strategy the fusion panel must draw from the same per-request
+  // ordering the auto-router just used for the chat half of the request. The
+  // raw setting value scores every decision-strategy request as plain Balanced,
+  // so a request the decision model routed 'smartest' got its chat answer from
+  // the big model and its panel slots auto-picked from the Balanced order.
+  const strategy = effectiveRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
   const chain = getActiveChain(db).filter(e => e.enabled);
 
@@ -1900,18 +2139,23 @@ export function getOrderedFusionChain(estimatedTokens: number, exactOutputReserv
  */
 export function resolveFusionCandidate(modelId: string): FusionCandidate | null {
   const db = getDb();
-  const row = db.prepare(`
+  const rows = db.prepare(`
     SELECT m.id as model_db_id, m.platform, m.model_id, m.display_name,
            m.size_label, m.supports_vision, m.supports_tools
     FROM models m
     WHERE m.model_id = ? AND m.enabled = 1
     ORDER BY m.intelligence_rank ASC, m.id ASC
-    LIMIT 1
-  `).get(modelId) as {
+  `).all(modelId) as {
     model_db_id: number; platform: string; model_id: string; display_name: string;
     size_label: string; supports_vision: number; supports_tools: number;
-  } | undefined;
-  if (row) {
+  }[];
+  if (rows.length > 0) {
+    // A logical model can have several enabled provider rows. Prefer one with
+    // an enabled, healthy/unknown key before falling back to the deterministic
+    // ranking. Without this check a duplicate alias can pin fusion to a
+    // keyless provider (for example a free relay) while a configured provider
+    // for the same model is available.
+    const row = rows.find(candidate => routableKeyIdsForModel(candidate.model_db_id).length > 0) ?? rows[0];
     return {
       modelDbId: row.model_db_id,
       platform: row.platform,
@@ -1930,7 +2174,11 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
   if (isUnifyEnabled()) {
     const resolved = resolveRequestedIdForDispatch(modelId, getModelGroups());
     if (resolved && resolved.memberDbIds.length > 0) {
-      const top = resolveModelGroupCandidates(resolved.memberDbIds, resolved.demotedDbIds)[0];
+      const candidates = resolveModelGroupCandidates(resolved.memberDbIds, resolved.demotedDbIds);
+      // Bare unified aliases may resolve to a provider row that is enabled in
+      // the catalog but has no usable key. Select the first routable member so
+      // an explicit fusion panel does not waste a slot on that dead end.
+      const top = candidates.find(candidate => routableKeyIdsForModel(candidate.model_db_id).length > 0) ?? candidates[0];
       if (top) {
         return {
           modelDbId: top.model_db_id,
@@ -1947,13 +2195,45 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
   return null;
 }
 
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false, skipPlatforms?: Set<string>, exactOutputReserve = 0, task?: 'code' | 'chat'): RouteResult {
+/**
+ * Route a request to the best available model.
+ *
+ * Ordering depends on the configured strategy (see orderChain) — or on
+ * `strategyOverride`, when the request named an `auto:<axis>` alias. Everything
+ * downstream — key round-robin, cooldowns, token pre-checks, custom base_url
+ * resolution, vision filtering, sticky sessions — is strategy-independent.
+ *
+ * If preferredModelDbId is set, that model gets tried FIRST (sticky sessions).
+ * This prevents hallucination from model switching mid-conversation.
+ *
+ * @param estimatedTokens - estimated total tokens for rate limit check
+ * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
+ * @param preferredModelDbId - try this model first (sticky session)
+ * @param requireVision - only consider models that accept image input (#118)
+ * @param requireTools - only consider models that emit structured tool_calls
+ * @param skipPlatforms - platforms ruled out for the rest of this request (#788)
+ * @param strategyOverride - score the chain under this preset instead of the
+ *   global one. Set by the `auto:<axis>` aliases (ResolvedChain.strategyOverride,
+ *   #1628); leave unset everywhere else.
+ */
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false, skipPlatforms?: Set<string>, exactOutputReserve = 0, task?: 'code' | 'chat', strategyOverride?: PresetStrategy): RouteResult {
   const db = getDb();
 
-  const strategy = getRoutingStrategy();
+  const rawChain = prefetchedChain ?? getActiveChain(db);
+  // A chain may carry its own routing preset (profiles.routing_strategy, #1696).
+  // Precedence for THIS request: an `auto:<axis>` alias (#1628) first, then the
+  // chain's own preset, then whatever the request otherwise routes with (the
+  // operator's setting, or the preset the 'decision' model picked, #1354).
+  // Ranking still goes through orderChain, so the reliability floor and the
+  // rate-limit/failure penalties keep applying; only the base preset changes.
+  const chainPreset = rawChain.find(e => e.profile_strategy)?.profile_strategy;
+  const strategy = strategyOverride
+    ?? ((chainPreset && VALID_STRATEGIES.includes(chainPreset as RoutingStrategy))
+      ? (chainPreset as RoutingStrategy)
+      : effectiveRoutingStrategy());
   if (strategy !== 'priority') refreshStatsCache(db);
 
-  const chain = (prefetchedChain ?? getActiveChain(db)).filter(e => e.enabled);
+  const chain = rawChain.filter(e => e.enabled);
 
   const sortedChain = orderChain(chain, strategy, true, task);
 
@@ -1988,6 +2268,9 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       if (skipPlatforms?.has(e.platform)) return false;
       if (requireVision && !e.supports_vision) return false;
       if (requireTools && !e.supports_tools) return false;
+      // Never spend the exploration slot on a model that keeps rejecting tool
+      // requests (#1230); it stays reachable at the back of the main walk.
+      if (requireTools && isToolBenched(e.platform, e.model_id, e.endpoint_scope)) return false;
       if (requireStructured && platformDropsResponseFormat(e.platform)) return false;
       if (!fitsContextWindow(e.platform, e.context_window, estimatedTokens, exactOutputReserve)) return false;
       if (e.tpm_limit != null && estimatedTokens > e.tpm_limit) return false;
@@ -2024,8 +2307,19 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         FROM models m
         WHERE m.id = ? AND m.enabled = 1
       `).get(preferredModelDbId) as ChainRow | undefined;
-      
-      if (pinnedRow) {
+
+      // A model retired upstream (#634: 410 end-of-life) must not be re-added
+      // by a client pin — the row stays `models.enabled = 1` by design, but the
+      // chain tables are off and the provider answers 410 on every call. An
+      // explicit pin bypasses both chain tables, so skip the injection and let
+      // the request fall through to the rest of the chain (or the normal
+      // exhaustion error when nothing is left). A user tombstone still pins:
+      // that deletion is dashboard-managed, and the user asking by name is
+      // newer intent than their own earlier delete.
+      const retiredUpstream = pinnedRow
+        && getCatalogModelTombstone(db, 'chat', pinnedRow.platform, pinnedRow.model_id)?.source === 'upstream_eol';
+
+      if (pinnedRow && !retiredUpstream) {
         sortedChain.unshift(pinnedRow);
       }
     }
@@ -2068,12 +2362,22 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   // sweep margin-fitting models first; ones that only fit the advertised window
   // stay eligible behind them. Worst case is one classified context_too_large
   // hop instead of no route at all.
+  //
+  // Same soft treatment for models that keep answering tool requests with a 400
+  // (#1230, lib/tool-capability.ts): on a tool request they go to the very back
+  // instead of being excluded, so the worst case is the old order, never an
+  // empty pool. An explicit pin keeps its place: the client named that model.
   const servingChain: ChainRow[] = [];
   const marginDeferred: ChainRow[] = [];
+  const toolDeferred: ChainRow[] = [];
   for (const e of routableChain) {
+    if (requireTools && e.model_db_id !== preferredModelDbId && isToolBenched(e.platform, e.model_id, e.endpoint_scope)) {
+      toolDeferred.push(e);
+      continue;
+    }
     (fitsContextWindow(e.platform, e.context_window, estimatedTokens, exactOutputReserve) ? servingChain : marginDeferred).push(e);
   }
-  servingChain.push(...marginDeferred);
+  servingChain.push(...marginDeferred, ...toolDeferred);
 
   for (const entry of servingChain) {
     const label = `${entry.platform}/${entry.model_id}`;
@@ -2126,9 +2430,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       // false (#956 review): e.g. `context 131072 < estimated 106000 x1.25 = 132500`.
       const reserve = Math.max(0, exactOutputReserve);
       const requiredWithMargin = Math.ceil(Math.max(0, estimatedTokens - reserve) * CONTEXT_WINDOW_SAFETY_FACTOR + reserve);
-      diag.push(TRIM_GUARDED_PLATFORMS.has(entry.platform)
-        ? `${label}: context ${entry.context_window} < estimated ${estimatedTokens}`
-        : `${label}: context ${entry.context_window} < estimated ${estimatedTokens} x${CONTEXT_WINDOW_SAFETY_FACTOR} = ${requiredWithMargin}`);
+      diag.push(`${label}: context ${entry.context_window} < estimated ${estimatedTokens} x${CONTEXT_WINDOW_SAFETY_FACTOR} = ${requiredWithMargin}`);
       continue;
     }
 

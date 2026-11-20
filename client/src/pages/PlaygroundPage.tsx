@@ -1,11 +1,14 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo, useCallback, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowUp, ChevronRight, CircleAlert, FileText, Paperclip, X } from 'lucide-react'
+import { ChevronRight, CircleAlert, FileText, Globe, X } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
-import { Button } from '@/components/ui/button'
 import { buildModelOptions } from '@/lib/model-groups'
 import type { Chain } from '@/components/chain-manager'
 import { Markdown } from '@/components/markdown'
+import { ArtifactHostContext } from '@/lib/artifact-host'
+import { ArtifactPanel, ARTIFACT_PANEL_TRANSITION_MS } from '@/components/playground/artifact-panel'
+import { ARTIFACT_WIDTH_STORAGE_KEY, clampArtifactWidth, readArtifactWidth } from '@/lib/artifact-panel-size'
+import { extractArtifacts, type Artifact, type ArtifactKind } from '@/lib/artifacts'
 import { CopyButton } from '@/components/copy-button'
 import { toast } from '@/lib/toast'
 import {
@@ -28,6 +31,21 @@ import {
 import { readChatStream } from '@/lib/playground-stream'
 import { ConversationSidebar } from '@/components/playground/conversation-sidebar'
 import { SettingsRail } from '@/components/playground/settings-rail'
+import { LiquidComposer } from '@/components/playground/liquid-composer'
+import { SearchSources } from '@/components/playground/search-sources'
+import { searchContextMessage, searchProviderName, searchReadinessHint, type SearchResult } from '@/lib/search'
+import { useSearchReadiness } from '@/hooks/use-search-readiness'
+import { ModelMakerIcon } from '@/components/model-maker-icon'
+import { composerHasContent } from '@/lib/composer-geometry'
+import {
+  DICTATION_AUTO,
+  DICTATION_MODEL_STORAGE_KEY,
+  appendDictation,
+  hasTranscription,
+  resolveDictationModel,
+  transcriptionOptions,
+  type TranscriptionModelRow,
+} from '@/lib/transcription'
 import {
   readSampling,
   samplingRequestParams,
@@ -46,6 +64,7 @@ import {
   updateConversation,
   writeActiveConversationId,
   type ChatMessage,
+  type WebSearchMeta,
   type ConversationSummary,
   type FusionPanelEntry,
 } from '@/lib/playground-conversations'
@@ -76,6 +95,23 @@ function fusionRouteLabel(p: { platform: string; model: string }): string {
   return p.model.startsWith(`${p.platform}/`) ? p.model : `${p.platform}/${p.model}`
 }
 
+// Smooth show/hide for the Playground's tucked-away detail (thinking, web
+// sources, the fusion panel). The content stays mounted and the row animates
+// from 0fr to 1fr, so it opens to its natural height without measuring;
+// `inert` keeps a closed panel's links out of the tab order.
+function Collapse({ open, children }: { open: boolean; children: ReactNode }) {
+  return (
+    <div
+      data-open={open}
+      className="grid transition-[grid-template-rows,opacity] duration-300 ease-out motion-reduce:transition-none data-[open=false]:opacity-0"
+      style={{ gridTemplateRows: open ? '1fr' : '0fr' }}
+      inert={!open}
+    >
+      <div className="min-h-0 overflow-hidden">{children}</div>
+    </div>
+  )
+}
+
 // Collapsible, minimal-font trace shown OUTSIDE the main answer bubble: each
 // panel model's raw answer as it streamed in, plus the judge that synthesized
 // the final answer. Default-open so you can watch it work; collapse to tuck away.
@@ -104,7 +140,7 @@ function FusionTrace({ panel, judge, streaming, answerStarted }: {
         <ChevronRight className={`size-3 transition-transform ${open ? 'rotate-90' : ''}`} />
         {t('playground.fusionTrace', { count: panel.length })}{streaming ? ' …' : ''}
       </button>
-      {open && (
+      <Collapse open={open}>
         <div className="mt-1 space-y-2 border-l border-border/60 pl-2.5">
           {panel.map((p, i) => (
             <div key={i} className="space-y-0.5">
@@ -123,7 +159,7 @@ function FusionTrace({ panel, judge, streaming, answerStarted }: {
             </div>
           )}
         </div>
-      )}
+      </Collapse>
     </div>
   )
 }
@@ -132,28 +168,49 @@ function FusionTrace({ panel, judge, streaming, answerStarted }: {
 // visual language as FusionTrace (minimal font, muted, hanging rule, chevron
 // toggle) and the same behaviour: open while it streams so you can watch the
 // model work, auto-collapsing once the answer itself starts.
-function ReasoningTrace({ text, answerStarted }: { text: string; answerStarted?: boolean }) {
+function ReplyTrace({ reasoning, search, answerStarted }: {
+  reasoning?: string
+  search?: WebSearchMeta
+  answerStarted?: boolean
+}) {
   const { t } = useI18n()
-  const [open, setOpen] = useState(true)
+  // Thinking opens while it streams and tucks away once the answer starts.
+  // Web sources never open on their own: they are there for the curious, so a
+  // searched reply with no thinking starts closed.
+  const [open, setOpen] = useState(() => !!reasoning && !answerStarted)
   const touched = useRef(false)
   useEffect(() => {
     if (answerStarted && !touched.current) setOpen(false)
   }, [answerStarted])
+  useEffect(() => {
+    if (reasoning && !answerStarted && !touched.current) setOpen(true)
+  }, [reasoning, answerStarted])
+  const sourceCount = search?.sources.length ?? 0
   return (
-    <div className="mb-2 text-[10px] leading-snug text-muted-foreground/80">
+    <div className="mb-2 text-muted-foreground/80">
       <button
         type="button"
         onClick={() => { touched.current = true; setOpen(o => !o) }}
-        className="inline-flex items-center gap-1 font-mono hover:text-foreground transition-colors"
+        aria-expanded={open}
+        className="inline-flex items-center gap-1 font-mono text-[10px] leading-snug hover:text-foreground transition-colors"
       >
-        <ChevronRight className={`size-3 transition-transform ${open ? 'rotate-90' : ''}`} />
+        <ChevronRight className={`size-3 transition-transform duration-300 ${open ? 'rotate-90' : ''}`} />
         {open ? t('common.hide') : t('common.show')}
+        {sourceCount > 0 && (
+          <span className="inline-flex items-center gap-1 opacity-80">
+            · <Globe className="size-2.5" /> {t('search.traceSources', { count: sourceCount })}
+          </span>
+        )}
       </button>
-      {open && (
-        <div className="mt-1 whitespace-pre-wrap border-l border-border/60 pl-2.5 italic opacity-80">
-          {text}
-        </div>
-      )}
+      <Collapse open={open}>
+        {search && sourceCount > 0 && <SearchSources search={search} />}
+        {reasoning && (
+          // Same type as the answer beneath it, size and leading, only quieter.
+          <div className="mt-1 whitespace-pre-wrap border-l border-border/60 pl-2.5 text-sm leading-relaxed text-muted-foreground">
+            {reasoning}
+          </div>
+        )}
+      </Collapse>
     </div>
   )
 }
@@ -176,6 +233,14 @@ function initialRailOpen(key: string): boolean {
   if (typeof window === 'undefined') return true
   if (!window.matchMedia('(min-width: 1024px)').matches) return false
   return localStorage.getItem(key) !== 'false'
+}
+
+function systemDictationHintKey(models: TranscriptionModelRow[] | undefined) {
+  const desktop = window as Window & { __FREEAPI_DESKTOP__?: boolean; __FREEAPI_PLATFORM__?: string }
+  // Wait for the catalog. A keyed provider with disabled models still uses the model setup flow.
+  if (!desktop.__FREEAPI_DESKTOP__ || !models || models.some(m => m.modality === 'transcription' && m.keyCount > 0)) return
+  if (desktop.__FREEAPI_PLATFORM__ === 'darwin') return 'playground.dictationMacShortcut'
+  if (desktop.__FREEAPI_PLATFORM__ === 'win32') return 'playground.dictationWindowsShortcut'
 }
 
 export default function PlaygroundPage() {
@@ -201,6 +266,16 @@ export default function PlaygroundPage() {
     setSampling(next)
     writeSampling(next)
   }
+  // "Search the web" (#1174): look the question up with POST /v1/search first
+  // and hand the model numbered sources to cite. A preference like the
+  // sampling knobs, so it is remembered here rather than per conversation.
+  const [webSearch, setWebSearch] = useState<boolean>(
+    () => localStorage.getItem('playground.webSearch') === '1',
+  )
+  const updateWebSearch = (enabled: boolean) => {
+    setWebSearch(enabled)
+    localStorage.setItem('playground.webSearch', enabled ? '1' : '0')
+  }
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [selectedModel, setSelectedModel] = useState<string>(
@@ -209,10 +284,6 @@ export default function PlaygroundPage() {
   // Files staged for the NEXT message: images already downscaled to a data URI,
   // text-like files already decoded. Cleared on send. (#325)
   const [attachments, setAttachments] = useState<Attachment[]>([])
-  // Purely cosmetic: the composer row centres its buttons against a one-line
-  // box, but pins them to the bottom once the textarea has grown, which is
-  // where the eye expects them on a tall message.
-  const [composerGrown, setComposerGrown] = useState(false)
   const [dragging, setDragging] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const transcriptRef = useRef<HTMLDivElement>(null)
@@ -255,6 +326,93 @@ export default function PlaygroundPage() {
     queryKey: ['unified-key'],
     queryFn: () => apiFetch('/api/settings/api-key'),
   })
+
+  // Speech-to-text for the composer's mic: which transcription models can
+  // route right now, and which one the user asked for (Auto by default,
+  // remembered in localStorage like the chat model).
+  const { data: mediaData } = useQuery<{ models: TranscriptionModelRow[] }>({
+    queryKey: ['media'],
+    queryFn: () => apiFetch('/api/media'),
+  })
+  const mediaModels = mediaData?.models ?? []
+
+  const searchReadiness = useSearchReadiness()
+  const usableEngines = searchReadiness.readyEngines
+  const webSearchAvailable = searchReadiness.available
+  const webSearchUnavailableHint = searchReadinessHint(searchReadiness.data, searchReadiness.failed, searchReadiness.loading, t)
+  const webSearchOn = webSearch && webSearchAvailable
+  const transcriptionAvailable = hasTranscription(mediaModels)
+  const shortcutHintKey = systemDictationHintKey(mediaData?.models)
+  const dictationUnavailableHint = transcriptionAvailable ? undefined : t(shortcutHintKey ?? 'playground.dictationUnavailable')
+  const [dictationChoice, setDictationChoice] = useState<string>(
+    () => localStorage.getItem(DICTATION_MODEL_STORAGE_KEY) ?? DICTATION_AUTO,
+  )
+  const pickDictationModel = (v: string) => {
+    setDictationChoice(v)
+    localStorage.setItem(DICTATION_MODEL_STORAGE_KEY, v)
+  }
+  const dictationOptions = transcriptionOptions(mediaModels, t('playground.autoModel'))
+  const dictationModel = resolveDictationModel(dictationChoice, mediaModels)
+
+  // Artifacts (#playground): runnable code in a reply (HTML, SVG) opens in a
+  // side panel with a sandboxed preview next to the source. A card in the
+  // reply opens it by hand; a reply that finishes with an artifact opens its
+  // first one on its own, once, like the Artifacts pattern users know.
+  const [artifact, setArtifact] = useState<Artifact | null>(null)
+  // `artifactOpen` drives the slide; the artifact itself stays mounted through
+  // the exit animation and is dropped once it has finished.
+  const [artifactOpen, setArtifactOpen] = useState(false)
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [artifactWidth, setArtifactWidth] = useState<number>(
+    () => readArtifactWidth(localStorage.getItem(ARTIFACT_WIDTH_STORAGE_KEY), window.innerWidth),
+  )
+  const commitArtifactWidth = (w: number) => {
+    const next = clampArtifactWidth(w, window.innerWidth)
+    setArtifactWidth(next)
+    localStorage.setItem(ARTIFACT_WIDTH_STORAGE_KEY, String(next))
+  }
+  const showArtifact = (a: Artifact) => {
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null }
+    setArtifact(a)
+    setArtifactOpen(true)
+  }
+  const closeArtifact = () => {
+    setArtifactOpen(false)
+    if (closeTimer.current) clearTimeout(closeTimer.current)
+    closeTimer.current = setTimeout(() => { setArtifact(null); closeTimer.current = null }, ARTIFACT_PANEL_TRANSITION_MS)
+  }
+  useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current) }, [])
+  const openArtifact = useCallback((kind: ArtifactKind, language: string, code: string) => {
+    if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = null }
+    setArtifact({
+      id: `manual:${code.length}:${code.slice(0, 40)}`,
+      kind,
+      language,
+      code,
+      title: /<title[^>]*>([^<]{1,120})<\/title>/i.exec(code)?.[1]?.trim() ?? null,
+      filename: kind === 'svg' ? 'artifact.svg' : 'artifact.html',
+    })
+    setArtifactOpen(true)
+  }, [])
+  const artifactHost = useMemo(() => ({ open: openArtifact, activeCode: artifact?.code ?? null }), [openArtifact, artifact?.code])
+  // Auto-open only for a reply that just finished HERE — not for every old
+  // conversation that happens to contain one, which would pop the panel on
+  // each visit. `loading` going true→false marks the reply's completion.
+  const wasLoadingRef = useRef(false)
+  useEffect(() => {
+    if (loading) { wasLoadingRef.current = true; return }
+    if (!wasLoadingRef.current) return
+    wasLoadingRef.current = false
+    const idx = messages.length - 1
+    const last = messages[idx]
+    if (!last || last.role !== 'assistant' || last.isError) return
+    const found = extractArtifacts(last.content, idx)
+    if (found.length === 0) return
+    // Deferred a tick: the open is a consequence of the reply landing, not
+    // part of rendering it, and it must not cascade into this commit.
+    const timer = setTimeout(() => showArtifact(found[0]), 0)
+    return () => clearTimeout(timer)
+  }, [loading, messages])
 
   const { data: fallbackEntries = [] } = useQuery<FallbackEntry[]>({
     queryKey: ['fallback'],
@@ -571,6 +729,7 @@ export default function PlaygroundPage() {
     start: number,
     routedVia: string | null,
     fallbackAttempts: string | null,
+    webSearchMeta?: WebSearchMeta,
   ) => {
     const via = routedVia
       ? { platform: routedVia.split('/')[0], model: routedVia.split('/').slice(1).join('/') }
@@ -596,6 +755,7 @@ export default function PlaygroundPage() {
             model: via?.model,
             latency: Date.now() - start,
             fallbackAttempts: fallbackAttempts ? parseInt(fallbackAttempts) : undefined,
+            ...(webSearchMeta ? { webSearch: webSearchMeta } : {}),
           },
         })
       }
@@ -689,12 +849,44 @@ export default function PlaygroundPage() {
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
+      const base = import.meta.env.BASE_URL.replace(/\/$/, '')
+
+      // Web search first, when it is on and there is a question to look up. A
+      // failed search is reported and the question is answered without it.
+      let searchContext: string | null = null
+      let webSearchMeta: WebSearchMeta | undefined
+      if (webSearchOn && text) {
+        const searchStart = Date.now()
+        try {
+          const res = await fetch(`${base}/v1/search`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ query: text, max_results: 5 }),
+          })
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }))
+            throw new Error(err.error?.message ?? err.message ?? `HTTP ${res.status}`)
+          }
+          const found = await res.json() as SearchResult
+          if (found.results.length > 0) {
+            searchContext = searchContextMessage(found)
+            webSearchMeta = {
+              engine: searchProviderName(found.provider),
+              latency: Date.now() - searchStart,
+              sources: found.results.map(r => ({ title: r.title, url: r.url })),
+            }
+          }
+        } catch (err) {
+          toast.error(t('search.playgroundFailed', { reason: err instanceof Error ? err.message : String(err) }))
+        }
+      }
 
       const isFusion = selectedModel === 'fusion'
       const sysPrompt = systemPrompt.trim()
       const body: any = {
         messages: [
           ...(sysPrompt ? [{ role: 'system', content: sysPrompt }] : []),
+          ...(searchContext ? [{ role: 'system', content: searchContext }] : []),
           ...newMessages.map(m => ({ role: m.role, content: toMessageContent(m.content, m.images) })),
         ],
         // Only the knobs switched on in the settings rail: temperature, top_p
@@ -712,7 +904,6 @@ export default function PlaygroundPage() {
       const controller = new AbortController()
       abortRef.current = controller
 
-      const base = import.meta.env.BASE_URL.replace(/\/$/, '')
       const start = Date.now()
       const res = await fetch(`${base}/v1/chat/completions`, {
         method: 'POST',
@@ -749,7 +940,7 @@ export default function PlaygroundPage() {
       // fall back to the buffered path rather than trusting that: a proxy in
       // front of us, or a future non-streaming route, can still hand back JSON.
       if (!isFusion && res.body && (res.headers.get('Content-Type') ?? '').includes('text/event-stream')) {
-        await streamChat(res.body, newMessages, start, routedVia, fallbackAttempts)
+        await streamChat(res.body, newMessages, start, routedVia, fallbackAttempts, webSearchMeta)
         return
       }
 
@@ -777,6 +968,7 @@ export default function PlaygroundPage() {
           fallbackAttempts: fallbackAttempts ? parseInt(fallbackAttempts) : undefined,
           fusionPanel: fusion?.panel,
           fusionJudge: fusion?.judge,
+          ...(webSearchMeta ? { webSearch: webSearchMeta } : {}),
         },
       }]
       setMessages(answered)
@@ -810,7 +1002,6 @@ export default function PlaygroundPage() {
   // leaves the old one in the sidebar. (resetConversationState stops an open
   // stream too, or its next frame would paste the half-finished answer back
   // into the empty transcript.)
-  const handleClear = handleNewConversation
 
   // Searchable picker options: auto + fusion pinned at the top, then every model
   // ordered BY INTELLIGENCE — size tier first (Frontier→Small), then the catalog
@@ -862,7 +1053,9 @@ export default function PlaygroundPage() {
     // the three panes that mean to. The transcript keeps its OWN scroll
     // container in the middle column — transcriptRef and the follow-the-stream
     // behaviour are untouched by the reshuffle.
-    <div className="flex min-h-0 flex-1 overflow-hidden">
+    // Every lucide icon in the three panes draws at 1.5 instead of the default
+    // 2: the page is dense with small glyphs and the bold stroke read heavy.
+    <div className="flex min-h-0 flex-1 overflow-hidden [&_svg]:stroke-[1.5]">
       <ConversationSidebar
         conversations={conversations}
         activeId={conversationId}
@@ -875,22 +1068,9 @@ export default function PlaygroundPage() {
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* The page header, reduced to a slim bar: the title, what is answering,
-            and the one action that belongs to the transcript rather than to a
-            rail. */}
-        <div className="flex shrink-0 items-center gap-2 border-b px-4 py-2">
-          <h1 className="shrink-0 text-sm font-semibold tracking-tight">{t('playground.title')}</h1>
-          <span className="min-w-0 truncate text-xs text-muted-foreground">
-            <span aria-hidden="true">· </span>{activeModelLabel}
-          </span>
-          {messages.length > 0 && (
-            <Button variant="outline" size="sm" className="ms-auto" onClick={handleClear}>
-              {t('playground.clear')}
-            </Button>
-          )}
-        </div>
-
-        <div ref={transcriptRef} className="min-h-0 flex-1 overflow-y-auto p-6 space-y-4">
+        <div ref={transcriptRef} className="min-h-0 flex-1 overflow-y-auto p-6">
+          {/* The chat sits in a centred column; the composer below shares its width. */}
+          <div className="mx-auto h-full w-full max-w-3xl space-y-4">
           {messages.length === 0 ? (
             <div className="flex items-center justify-center h-full text-center">
               <div className="space-y-2 max-w-sm">
@@ -912,15 +1092,18 @@ export default function PlaygroundPage() {
                 const showBubble = msg.role === 'user' || msg.content.length > 0 || !!msg.reasoning
                 return (
                   <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`flex flex-col gap-1 max-w-[80%] ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                    {/* The user speaks in a bubble; the assistant answers as plain
+                        text across the whole column — no box, no padding, no fill.
+                        Errors keep their tinted box so they read as errors. */}
+                    <div className={`flex flex-col gap-1 ${msg.role === 'user' ? 'max-w-[80%] items-end' : 'w-full items-start'}`}>
                       {showBubble && (
                         <div
-                          className={`group relative rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                          className={`group relative text-sm leading-relaxed ${
                             msg.role === 'user'
-                              ? 'bg-primary text-primary-foreground'
+                              ? 'rounded-2xl bg-primary px-4 py-2.5 text-primary-foreground'
                               : msg.isError
-                                ? 'border border-destructive/25 bg-destructive/10 text-destructive'
-                                : 'bg-muted'
+                                ? 'rounded-2xl border border-destructive/25 bg-destructive/10 px-4 py-2.5 text-destructive'
+                                : 'w-full'
                           }`}
                         >
                           {msg.images && msg.images.length > 0 && (
@@ -940,20 +1123,19 @@ export default function PlaygroundPage() {
                             </div>
                           ) : msg.role === 'assistant' ? (
                             <>
-                              {msg.reasoning && (
-                                <ReasoningTrace text={msg.reasoning} answerStarted={msg.content.length > 0} />
+                              {(msg.reasoning || (msg.meta?.webSearch && msg.meta.webSearch.sources.length > 0)) && (
+                                <ReplyTrace
+                                  reasoning={msg.reasoning}
+                                  search={msg.meta?.webSearch}
+                                  answerStarted={msg.content.length > 0}
+                                />
                               )}
-                              <Markdown>{msg.content}</Markdown>
+                              <ArtifactHostContext.Provider value={artifactHost}>
+                                <Markdown>{msg.content}</Markdown>
+                              </ArtifactHostContext.Provider>
                             </>
                           ) : (
                             <div className="whitespace-pre-wrap">{msg.content}</div>
-                          )}
-                          {msg.role === 'assistant' && !msg.isError && msg.content && (
-                            <CopyButton
-                              text={msg.content}
-                              label={t('playground.copyReply')}
-                              className="absolute right-1.5 top-1.5 size-6 opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-100"
-                            />
                           )}
                           {msg.meta && (
                             <div className="flex items-center gap-2 mt-2 flex-wrap text-[11px] opacity-70 tabular-nums">
@@ -975,8 +1157,12 @@ export default function PlaygroundPage() {
                                 </>
                               ) : (
                                 <>
-                                  {msg.meta.platform && <span>{msg.meta.platform}</span>}
-                                  {msg.meta.model && <span className="font-mono">· {msg.meta.model}</span>}
+                                  {/* The maker's mark stands in for the host's name; the
+                                      host is in the tooltip. Unknown makers get a neutral glyph. */}
+                                  {(msg.meta.model || msg.meta.platform) && (
+                                    <ModelMakerIcon modelId={msg.meta.model} platform={msg.meta.platform} className="size-3" />
+                                  )}
+                                  {msg.meta.model && <span className="font-mono">{msg.meta.model}</span>}
                                   {/* Which provider served it is known from the
                                       response headers straight away; the timing
                                       only means something once the last frame
@@ -987,7 +1173,21 @@ export default function PlaygroundPage() {
                                   )}
                                 </>
                               )}
+                              {msg.role === 'assistant' && !msg.isError && msg.content && (
+                                <CopyButton
+                                  text={msg.content}
+                                  label={t('playground.copyReply')}
+                                  className="size-5 border-0 bg-transparent opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-60 hover:!opacity-100"
+                                />
+                              )}
                             </div>
+                          )}
+                          {!msg.meta && msg.role === 'assistant' && !msg.isError && msg.content && (
+                            <CopyButton
+                              text={msg.content}
+                              label={t('playground.copyReply')}
+                              className="mt-1 size-5 border-0 bg-transparent opacity-0 transition-opacity focus-visible:opacity-100 group-hover:opacity-60 hover:!opacity-100"
+                            />
                           )}
                         </div>
                       )}
@@ -1008,7 +1208,7 @@ export default function PlaygroundPage() {
                   whole message on the buffered path. */}
               {loading && messages[messages.length - 1]?.role === 'user' && (
                 <div className="flex justify-start">
-                  <div className="bg-muted rounded-2xl px-4 py-3">
+                  <div className="py-2">
                     <div className="flex gap-1">
                       <span className="size-1.5 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '0ms' }} />
                       <span className="size-1.5 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '150ms' }} />
@@ -1020,10 +1220,11 @@ export default function PlaygroundPage() {
               <div ref={messagesEndRef} />
             </>
           )}
+          </div>
         </div>
 
         <div
-          className={`bg-background/50 p-3 transition-colors ${dragging ? 'bg-primary/5 ring-1 ring-inset ring-primary/40' : ''}`}
+          className={`mx-auto w-full max-w-3xl px-6 pb-4 pt-1 transition-colors ${dragging ? 'rounded-2xl bg-primary/5 ring-1 ring-inset ring-primary/40' : ''}`}
           onDragOver={e => { e.preventDefault(); setDragging(true) }}
           onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false) }}
           onDrop={e => {
@@ -1059,71 +1260,74 @@ export default function PlaygroundPage() {
               <span>{t('playground.visionWarning', { model: activeModelLabel })}</span>
             </div>
           )}
-          <div className={`flex gap-2 ${composerGrown ? 'items-end' : 'items-center'}`}>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept={ACCEPT_ATTRIBUTE}
-              className="hidden"
-              onChange={e => {
-                addFiles([...(e.target.files ?? [])])
-                e.target.value = ''
-              }}
-            />
-            <Button
-              variant="ghost"
-              size="icon"
-              className="text-muted-foreground hover:text-foreground"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={loading}
-              aria-label={t('playground.attach')}
-              title={t('playground.attach')}
-            >
-              <Paperclip className="size-4" />
-            </Button>
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              onPaste={e => {
-                // Screenshot straight from the clipboard; a normal text paste
-                // carries no files and falls through untouched.
-                const files = [...e.clipboardData.files]
-                if (files.length === 0) return
-                e.preventDefault()
-                addFiles(files)
-              }}
-              placeholder={t('playground.inputPlaceholder')}
-              rows={1}
-              className="flex-1 resize-none rounded-lg border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50 min-h-[40px] max-h-[160px]"
-              style={{ height: 'auto', overflow: 'hidden' }}
-              onInput={e => {
-                const el = e.target as HTMLTextAreaElement
-                el.style.height = 'auto'
-                const height = Math.min(el.scrollHeight, 160)
-                el.style.height = height + 'px'
-                setComposerGrown(height > 44)
-              }}
-            />
-            <Button
-              onClick={handleSend}
-              disabled={loading || (!input.trim() && attachments.length === 0)}
-              size="icon"
-              className="rounded-full"
-              aria-label={loading ? t('playground.sending') : t('playground.send')}
-              title={loading ? t('playground.sending') : t('playground.send')}
-            >
-              <ArrowUp className="size-4" />
-            </Button>
-          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept={ACCEPT_ATTRIBUTE}
+            className="hidden"
+            onChange={e => {
+              addFiles([...(e.target.files ?? [])])
+              e.target.value = ''
+            }}
+          />
+          <LiquidComposer
+            inputRef={inputRef}
+            value={input}
+            onChange={setInput}
+            onKeyDown={handleKeyDown}
+            onPaste={e => {
+              // Screenshot straight from the clipboard; a normal text paste
+              // carries no files and falls through untouched.
+              const files = [...e.clipboardData.files]
+              if (files.length === 0) return
+              e.preventDefault()
+              addFiles(files)
+            }}
+            placeholder={t('playground.inputPlaceholder')}
+            hasContent={composerHasContent(input, attachments.length)}
+            loading={loading}
+            onSend={handleSend}
+            onAttach={() => fileInputRef.current?.click()}
+            labels={{ add: t('playground.addMenu'), attach: t('playground.attach'), send: t('playground.send'), sending: t('playground.sending') }}
+            dictation={{
+              onUnavailable: dictationUnavailableHint ? () => {
+                if (shortcutHintKey) inputRef.current?.focus()
+                toast.info(dictationUnavailableHint)
+              } : undefined,
+              model: dictationModel,
+              apiKey: keyData?.apiKey,
+              onText: text => {
+                setInput(prev => appendDictation(prev, text))
+                inputRef.current?.focus()
+              },
+            }}
+            webSearch={{
+              enabled: webSearchOn,
+              available: webSearchAvailable,
+              label: t('search.playgroundToggle'),
+              unavailableHint: webSearchUnavailableHint,
+              onToggle: updateWebSearch,
+            }}
+          />
         </div>
       </div>
 
       {/* Last column, and last in the DOM on purpose: the system prompt textarea
           it carries must never come before the composer's, which is what a
           plain `textarea` selector reaches for. */}
+      {/* The artifact panel takes the rail's column while something is open;
+          closing it brings the settings rail back as it was. */}
+      {artifact ? (
+        <ArtifactPanel
+          artifact={artifact}
+          open={artifactOpen}
+          width={artifactWidth}
+          onWidthChange={setArtifactWidth}
+          onWidthCommit={commitArtifactWidth}
+          onClose={closeArtifact}
+        />
+      ) : (
       <SettingsRail
         open={settingsOpen}
         onToggle={toggleSettings}
@@ -1131,11 +1335,21 @@ export default function PlaygroundPage() {
         modelOptions={pickerOptions}
         onSelectModel={pickModel}
         noModels={availableModels.length === 0}
+        dictationValue={dictationModel}
+        dictationOptions={dictationOptions}
+        onSelectDictation={pickDictationModel}
+        dictationUnavailableHint={dictationUnavailableHint}
         systemPrompt={systemPrompt}
         onSystemPromptChange={updateSystemPrompt}
         sampling={sampling}
         onSamplingChange={updateSampling}
+        webSearch={webSearch}
+        onWebSearchChange={updateWebSearch}
+        webSearchAvailable={webSearchAvailable}
+        webSearchUnavailableHint={webSearchUnavailableHint}
+        webSearchChain={usableEngines.map(e => e.displayName).join(' → ')}
       />
+      )}
     </div>
   )
 }

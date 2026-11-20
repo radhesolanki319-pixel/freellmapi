@@ -33,10 +33,11 @@ export function seedDefaultProviders(db: Db): void {
       console.log("[db] Creating initial admin account...");
       db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)")
         .run("botn7079@gmail.com", adminHash);
-    } else {
-      db.prepare("UPDATE users SET password_hash = ? WHERE email = ?")
-        .run(adminHash, "botn7079@gmail.com");
     }
+    // NOTE: an earlier hotfix also reset the admin password hash on every
+    // boot when users already existed. That made every restart/redeploy
+    // silently revert the admin password, so it was removed 2026-11-20 —
+    // the seed must never overwrite an existing account's password.
   } catch (err: any) {
     console.error("[db] Seed error:", err.message);
   }

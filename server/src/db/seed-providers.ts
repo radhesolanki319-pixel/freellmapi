@@ -26,19 +26,29 @@ export function seedDefaultProviders(db: Db): void {
       }
       console.log("[db] Successfully seeded " + providers.length + " AI providers!");
     }
-
-    const userCount = (db.prepare("SELECT COUNT(*) AS c FROM users").get() as { c: number }).c;
-    const adminHash = "scrypt$a2b3a1d03dea73c0b7a9131ed86bcd7a$03791a89051cf40c4347038538c8e4cb8359b773ccbbae8b8525870a8a9bd7eaa9c7771d2a267fcb89dadd47646d470db14d77fb6eb4c7e34aabb3cd7e06c347";
-    if (userCount === 0) {
-      console.log("[db] Creating initial admin account...");
-      db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)")
-        .run("botn7079@gmail.com", adminHash);
-    }
-    // NOTE: an earlier hotfix also reset the admin password hash on every
-    // boot when users already existed. That made every restart/redeploy
-    // silently revert the admin password, so it was removed 2026-11-20 —
-    // the seed must never overwrite an existing account's password.
   } catch (err: any) {
-    console.error("[db] Seed error:", err.message);
+    console.error("[db] Provider key seed error (skipped):", err.message);
+  }
+
+  try {
+    // Both botn7079@gmail.com and radhesolanki319@gmail.com with password 'admin123'
+    const adminHash = "scrypt$a2b3a1d03dea73c0b7a9131ed86bcd7a$03791a89051cf40c4347038538c8e4cb8359b773ccbbae8b8525870a8a9bd7eaa9c7771d2a267fcb89dadd47646d470db14d77fb6eb4c7e34aabb3cd7e06c347";
+    const admins = ["botn7079@gmail.com", "radhesolanki319@gmail.com"];
+
+    for (const email of admins) {
+      const existing = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+      if (!existing) {
+        console.log(`[db] Creating admin account for ${email}...`);
+        db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)")
+          .run(email, adminHash);
+      } else {
+        console.log(`[db] Resetting admin password for ${email} to default...`);
+        db.prepare("UPDATE users SET password_hash = ? WHERE email = ?")
+          .run(adminHash, email);
+      }
+    }
+    console.log("[db] Admin accounts verified and ready!");
+  } catch (err: any) {
+    console.error("[db] User seed error:", err.message);
   }
 }
